@@ -1,0 +1,19 @@
+{
+    "dataset": "OpenWebText",
+    "vocab_file": "/home/kemove/Courses/STF_LLM/Assignment_1/data/OpenWebText/vocab.json",
+    "merges_file": "/home/kemove/Courses/STF_LLM/Assignment_1/data/OpenWebText/merges.txt",
+    "special_tokens": [
+        "<|endoftext|>"
+    ],
+    "checkpoint_path": "/home/kemove/Courses/STF_LLM/Assignment_1/checkpoints/best_model.pt",
+    "context_length": 1024,
+    "d_model": 768,
+    "num_layers": 12,
+    "num_heads": 16,
+    "d_ff": 3072,
+    "rope_theta": 10000.0,
+    "dropout": 0.1,
+    "max_new_tokens": 100,
+    "temperature": 0.8,
+    "top_p": 0.9
+}

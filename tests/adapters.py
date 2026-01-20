@@ -9,14 +9,18 @@ from jaxtyping import Float, Int
 
 import numpy.typing as npt
 
-from cs336_basics.bpe_tokenizer import train_bpe, Tokenizer
-
-from cs336_basics.utils import Linear, Embedding, RMSNorm, SwiGLU_FFN
-from cs336_basics.utils import silu, softmax, cross_entropy, gradient_clipping
-from cs336_basics.utils import data_loading, save_checkpoint, load_checkpoint
-from cs336_basics.attention import RotaryPositionalEmbedding, scaled_dot_product_attention, MultiHeadSelfAttention
-from cs336_basics.transformer import TransformerBlock, TransformerLM
-from cs336_basics.optimizer import AdamW, cos_learning_rate_schedule_with_warmup
+from model.tokenizer.bpe_tokenizer import train_bpe, Tokenizer
+from model.architecture.mlp import Linear, MLP as SwiGLU_FFN
+from model.utils import Embedding, RMSNorm
+from model.architecture.mlp import silu
+from model.attention.utils import softmax
+from model.utils import cross_entropy, gradient_clipping
+from model.utils import data_loading, save_checkpoint, load_checkpoint
+from model.utils import cos_learning_rate_schedule_with_warmup
+from model.attention.utils import RotaryPositionalEmbedding, scaled_dot_product_attention
+from model.attention.MHA import MultiHeadSelfAttention
+from model.transformer import TransformerBlock, TransformerLM
+from model.optimizer.AdamW import AdamW
 
 
 def run_train_bpe(

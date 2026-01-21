@@ -23,6 +23,7 @@ class Block(nn.Module):
         self,
         config: Config,
         rope: RotaryPositionalEmbedding,
+        layer_id: int,
         use_moe: bool,
         device=None,
         dtype=None
@@ -30,6 +31,26 @@ class Block(nn.Module):
         super().__init__()
         self.use_moe = use_moe
         self.attention_type = config.attention_type
+        self.layer_id = layer_id
+        self.use_engram = config.use_engram and (layer_id in config.engram_layer_ids)
+
+        # Initialize Engram module if this layer uses it
+        self.engram = None
+        if self.use_engram:
+            self.engram = Engram(
+                layer_id=layer_id,
+                layer_ids=config.engram_layer_ids,
+                hidden_size=config.d_model,
+                kernel_size=config.engram_kernel_size,
+                hc_mult=config.hc_mult,
+                vocab_size=config.engram_vocab_size,
+                ngram_size=config.engram_max_ngram_size,
+                embd_dim_per_ngram=config.engram_n_embed_per_ngram,
+                head_num_per_ngram=config.engram_n_head_per_ngram,
+                tokenizer_path=config.engram_tokenizer_path,
+                pad_id=config.engram_pad_id,
+                seed=config.seed
+            )
 
         # Select attention mechanism based on attention_type
         if config.attention_type == "MHA":
@@ -89,7 +110,7 @@ class Block(nn.Module):
         self.dropout = nn.Dropout(config.dropout) if config.dropout else nn.Identity()
 
     def forward(self, x: torch.Tensor, residual: torch.Tensor, start_pos: int = 0,
-                mask: torch.Tensor = None) -> torch.Tensor:
+                mask: torch.Tensor = None, input_ids: torch.Tensor = None) -> torch.Tensor:
         """
         Forward pass with Fused Add & Norm optimization.
 
@@ -98,11 +119,24 @@ class Block(nn.Module):
             residual: residual tensor from previous layer (or None for first layer)
             start_pos: starting position for RoPE and KV cache
             mask: optional causal attention mask (shared across all layers)
+            input_ids: optional input token IDs for Engram module
 
         Returns:
             - output tensor
             - updated residual tensor
         """
+        # Apply Engram module before attention (if enabled for this layer)
+        if self.engram is not None and input_ids is not None:
+            # For non-hyper-connection mode, unsqueeze to match expected shape
+            if x.dim() == 3:
+                x_hc = x.unsqueeze(2)  # (B, L, D) -> (B, L, 1, D)
+                engram_out = self.engram(hidden_states=x_hc, input_ids=input_ids)
+                x = x + engram_out.squeeze(2)  # (B, L, 1, D) -> (B, L, D)
+            else:
+                # Already in hyper-connection format (B, L, hc_mult, D)
+                engram_out = self.engram(hidden_states=x, input_ids=input_ids)
+                x = x + engram_out
+
         # Fused Add & Norm for ATTA
         if residual is None:
             x, residual = self.att_norm(x), x
@@ -134,6 +168,7 @@ class TransformerLM(nn.Module):
         super().__init__()
         self.config = config
         self.use_moe = config.use_moe
+        self.use_engram = config.use_engram
         self.attention_type = config.attention_type
         self.context_length = config.context_length
 
@@ -146,11 +181,12 @@ class TransformerLM(nn.Module):
             device=device
         )
 
-        # Build Transformer layers with optional MoE and configurable attention
+        # Build Transformer layers with optional MoE, Engram, and configurable attention
         self.layers = nn.ModuleList([
             Block(
                 config=config,
                 rope=self.rope,
+                layer_id=i,
                 use_moe=(config.use_moe and (config.moe_layers is None or i in config.moe_layers)),
                 device=device,
                 dtype=dtype
@@ -167,8 +203,16 @@ class TransformerLM(nn.Module):
         The causal attention mask is constructed once here and shared across all layers
         for efficiency. This avoids redundant mask construction in each attention layer.
         The residual connection is fused with normalization for memory efficiency.
+
+        Args:
+            x: input token IDs tensor of shape (batch_size, seq_len)
+            start_pos: starting position for RoPE and KV cache
+
+        Returns:
+            logits tensor of shape (batch_size, seq_len, vocab_size)
         """
         seq_len = x.size(1)
+        input_ids = x  # Store original input_ids for Engram
 
         x = self.token_embeddings(x)  # apply token embedding
 
@@ -178,7 +222,7 @@ class TransformerLM(nn.Module):
 
         residual = None
         for block in self.layers:
-            x, residual = block(x, residual, start_pos, mask)
+            x, residual = block(x, residual, start_pos, mask, input_ids=input_ids)
 
         x, _ = self.final_norm(x, residual)
         return self.lm_head(x)  # model token probability distribution

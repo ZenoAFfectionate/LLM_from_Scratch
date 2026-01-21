@@ -17,6 +17,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.nn.utils import clip_grad_norm_
 
+from model.config import Config
 from model.transformer import TransformerLM
 from model.tokenizer.bpe_tokenizer import Tokenizer
 from data.lm_dataset import PretrainDataset
@@ -160,9 +161,8 @@ def main():
                         help='Number of gradient accumulation steps to simulate larger batch size')
     args = parser.parse_args()
 
-    # Load configuration
-    with open(args.config, 'r') as f:
-        config = json.load(f)
+    # Load configuration using Config class
+    config = Config.from_json(args.config)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
@@ -173,61 +173,65 @@ def main():
         torch.backends.cudnn.benchmark = True       # enable cuDNN benchmark
         print("Performance optimizations enabled: TF32 matmul, cuDNN benchmark")
 
-    torch.manual_seed(config['seed'])
-    np.random.seed(config['seed'])
+    torch.manual_seed(config.seed)
+    np.random.seed(config.seed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed(config['seed'])
+        torch.cuda.manual_seed(config.seed)
 
-    # Create extended config with gradient accumulation info for wandb
-    wandb_config = config.copy()
+    # Create extended config dict for wandb (config is still Config object)
+    wandb_config = config.to_dict()
     wandb_config['gradient_accumulation_steps'] = args.gradient_accumulation_steps
-    wandb_config['effective_batch_size'] = config['batch_size'] * args.gradient_accumulation_steps
+    wandb_config['effective_batch_size'] = config.batch_size * args.gradient_accumulation_steps
 
     wandb.init(
         project="Transformer_LLM",
         entity="scut_zeno",
-        name=config.get('run_name', 'transformer_training'),
+        name=config.run_name,
         config=wandb_config
     )
 
     # Load tokenizer
     tokenizer = Tokenizer.from_files(
-        vocab_filepath=config['vocab_file'],
-        merges_filepath=config['merges_file'],
-        special_tokens=config.get('special_tokens', ['<|endoftext|>'])
+        vocab_filepath=config.vocab_file,
+        merges_filepath=config.merges_file,
+        special_tokens=config.special_tokens
     )
 
     vocab_size = len(tokenizer.decoder_vocab)
     print(f"Vocabulary size: {vocab_size:,}")
 
-    train_data, valid_data = prepare_data(config, tokenizer)
+    # Update config with actual vocab_size
+    config.vocab_size = vocab_size
 
-    num_workers = config.get('num_workers', 8)
+    # Prepare data using config attributes
+    train_data, valid_data = prepare_data(config.to_dict(), tokenizer)
+
+    num_workers = config.num_workers
 
     # create training dataset and loader
     train_dataset = PretrainDataset(
         data=train_data,
-        context_length=config['context_length']
+        context_length=config.context_length
     )
     train_loader = DataLoader(
         train_dataset,
-        batch_size=config['batch_size'],
+        batch_size=config.batch_size,
         shuffle=True,
-        num_workers=num_workers, 
+        num_workers=num_workers,
         pin_memory=True if num_workers > 0 else False,
         persistent_workers=True if num_workers > 0 else False,
-        prefetch_factor=4 if num_workers > 0 else None, 
+        prefetch_factor=4 if num_workers > 0 else None,
         drop_last=True,
     )
 
     # create validate dataset and loader
     valid_dataset = PretrainDataset(
         data=valid_data,
-        context_length=config['context_length']
+        context_length=config.context_length
     )
     valid_loader = DataLoader(
         valid_dataset,
-        batch_size=config['batch_size'],
+        batch_size=config.batch_size,
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True if num_workers > 0 else False,
@@ -242,28 +246,9 @@ def main():
 
     model_dtype = torch.float32  # Always use FP32 for model weights
 
-    # Initialize model with explicit dtype
+    # Initialize model with Config object
     model = TransformerLM(
-        vocab_size=vocab_size,
-        context_length=config['context_length'],
-        d_model=config['d_model'],
-        num_layers=config['num_layers'],
-        num_heads=config['num_heads'],
-        d_ff=config['d_ff'],
-        rope_theta=config['rope_theta'],
-        drop_p=config.get('dropout', 0.0),
-        use_moe=config.get('use_moe', False),
-        moe_layers=config.get('moe_layers', None),
-        n_routed_experts=config.get('n_routed_experts', 8),
-        num_experts_per_tok=config.get('num_experts_per_tok', 2),
-        n_shared_experts=config.get('n_shared_experts', 0),
-        aux_seq_loss_alpha=config.get('aux_seq_loss_alpha', 0.0),
-        bias_update_speed=config.get('bias_update_speed', 0.01),
-        num_kv_heads=config.get('num_kv_heads', config['num_heads']),
-        attention_type=config.get('attention_type', 'GQA'),
-        rope_dim=config.get('rope_dim', None),
-        kv_lora_rank=config.get('kv_lora_rank', None),
-        q_lora_rank=config.get('q_lora_rank', None),
+        config=config,
         device=device,
         dtype=model_dtype
     ).to(device)
@@ -281,10 +266,10 @@ def main():
     # Initialize optimizer
     optimizer = AdamW(
         model.parameters(),
-        lr=config['max_lr'],
-        betas=(config['beta1'], config['beta2']),
-        eps=config['eps'],
-        weight_decay=config['weight_decay'],
+        lr=config.max_lr,
+        betas=(config.beta1, config.beta2),
+        eps=config.eps,
+        weight_decay=config.weight_decay,
         fused=True
     )
 
@@ -295,32 +280,32 @@ def main():
         start_iteration = load_checkpoint(args.resume, model, optimizer)
         print(f"Resumed from iteration {start_iteration}")
     # config model type
-    attention_type = config.get('attention_type', 'MHA')
-    use_moe = config.get('use_moe', False)
+    attention_type = config.attention_type
+    use_moe = config.use_moe
     ffn_type = 'MoE' if use_moe else 'FFN'
     module_config = f"{attention_type}+{ffn_type}"
     # config ckpt dirtory
-    dataset_name = config['dataset']
+    dataset_name = config.dataset
     checkpoint_folder_name = f"{dataset_name}_{module_config}"
-    checkpoint_dir = Path(config['checkpoint_dir']) / checkpoint_folder_name
+    checkpoint_dir = Path(config.checkpoint_dir) / checkpoint_folder_name
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Checkpoint directory: {checkpoint_dir}")
 
     # get gradient accumulation steps from command line argument
     gradient_accumulation_steps = args.gradient_accumulation_steps
-    effective_batch_size = config['batch_size'] * gradient_accumulation_steps
+    effective_batch_size = config.batch_size * gradient_accumulation_steps
     print(f"Gradient Accumulation: {gradient_accumulation_steps} steps")
-    print(f"Micro Batch Size: {config['batch_size']}")
+    print(f"Micro Batch Size: {config.batch_size}")
     print(f"Effective Batch Size: {effective_batch_size}")
 
     record_file_path = checkpoint_dir / "record.txt" # create record file path
 
     # initialize record file with header and config
     with open(record_file_path, 'w') as record_file:
-        record_file.write(f"Training Record for {config['dataset']}\n")
+        record_file.write(f"Training Record for {config.dataset}\n")
         record_file.write("=" * 80 + "\n")
-        record_file.write(f"Model: {config.get('run_name', 'transformer_training')}\n")
+        record_file.write(f"Model: {config.run_name}\n")
         record_file.write(f"Started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
         record_file.write(f"Config file: {args.config}\n")
         record_file.write("=" * 80 + "\n\n")
@@ -328,7 +313,7 @@ def main():
         # Write full configuration
         record_file.write("CONFIGURATION:\n")
         record_file.write("-" * 80 + "\n")
-        record_file.write(json.dumps(config, indent=2))
+        record_file.write(json.dumps(config.to_dict(), indent=2))
         record_file.write("\n" + "-" * 80 + "\n\n")
 
         # Write model architecture summary
@@ -338,7 +323,7 @@ def main():
         record_file.write(f"Total parameters: {total_params:,}\n")
         record_file.write(f"Trainable parameters: {trainable_params:,}\n")
         record_file.write(f"Gradient Accumulation Steps: {gradient_accumulation_steps}\n")
-        record_file.write(f"Micro Batch Size: {config['batch_size']}\n")
+        record_file.write(f"Micro Batch Size: {config.batch_size}\n")
         record_file.write(f"Effective Batch Size: {effective_batch_size}\n")
         record_file.write("-" * 80 + "\n\n")
 
@@ -355,16 +340,16 @@ def main():
     # to ensures we never run out of data during training
     train_loader_iter = iter(train_loader)
 
-    for iteration in range(start_iteration, config['max_iterations']):
+    for iteration in range(start_iteration, config.max_iterations):
         start_time = time.time()
 
         # update learning rate
         lr = cos_learning_rate_schedule_with_warmup(
             iteration,
-            max_lr=config['max_lr'],
-            min_lr=config['min_lr'],
-            warmup_iter=config['warmup_iterations'],
-            cos_iter=config['max_iterations']
+            max_lr=config.max_lr,
+            min_lr=config.min_lr,
+            warmup_iter=config.warmup_iterations,
+            cos_iter=config.max_iterations
         )
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
@@ -395,8 +380,8 @@ def main():
         step_time = time.time() - start_time
 
         # Log training metrics
-        if (iteration + 1) % config['log_interval'] == 0:
-            avg_loss = running_loss / config['log_interval']
+        if (iteration + 1) % config.log_interval == 0:
+            avg_loss = running_loss / config.log_interval
             perplexity = np.exp(avg_loss)
 
             content = f"Iter {iteration + 1:6d} | Loss: {avg_loss:.4f} | PPL: {perplexity:.2f} | " \
@@ -418,9 +403,9 @@ def main():
             running_loss = 0.0
 
         # Validation and checkpointing
-        if (iteration + 1) % config['eval_interval'] == 0:
+        if (iteration + 1) % config.eval_interval == 0:
             print("Running validation...")
-            val_loss, val_perplexity = valid(model, valid_loader, config, device)
+            val_loss, val_perplexity = valid(model, valid_loader, config.to_dict(), device)
 
             val_content = f"Validation | Loss: {val_loss:.4f} | PPL: {val_perplexity:.2f}"
             print(val_content)
@@ -464,7 +449,7 @@ def main():
     with open(record_file_path, 'a') as record_file:
         record_file.write(f"\n{'='*50}\n")
         record_file.write(f"Training completed at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-        record_file.write(f"Total iterations: {config['max_iterations']}\n")
+        record_file.write(f"Total iterations: {config.max_iterations}\n")
         record_file.write(f"Final validation loss: {best_val_loss:.4f}   Final PPL: {best_val_ppl:.2f}\n")
         record_file.write(f"{'='*50}\n")
 
@@ -473,7 +458,7 @@ def main():
 
     # Save final checkpoint
     final_checkpoint_path = checkpoint_dir / "final_model.pt"
-    save_checkpoint(model, optimizer, config['max_iterations'], str(final_checkpoint_path))
+    save_checkpoint(model, optimizer, config.max_iterations, str(final_checkpoint_path))
     final_checkpoint_content = f"Final checkpoint saved: {final_checkpoint_path}"
     print(final_checkpoint_content)
 

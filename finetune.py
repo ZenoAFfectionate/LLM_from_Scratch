@@ -21,6 +21,7 @@ import torch.nn as nn
 import wandb
 
 
+from model.config import Config
 from model.transformer import TransformerLM
 from model.tokenizer.bpe_tokenizer import Tokenizer
 from torch.optim import AdamW
@@ -31,7 +32,7 @@ from model.utils import (
     save_checkpoint, load_checkpoint,
     cos_learning_rate_schedule_with_warmup
 )
-from model.lora import (
+from Courses.STF_LLM.Assignment_1.utils.lora import (
     apply_lora,
     freeze_non_lora_params,
     get_lora_params,
@@ -233,9 +234,8 @@ def main():
 
     args = parser.parse_args()
 
-    # Load configuration from pretrained model
-    with open(args.config, 'r') as f:
-        config = json.load(f)
+    # Load configuration using Config class
+    config = Config.from_json(args.config)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
@@ -247,63 +247,47 @@ def main():
         print("Performance optimizations enabled: TF32 matmul, cuDNN benchmark")
 
     # Set random seeds
-    seed = config.get('seed', 42)
+    seed = config.seed
     torch.manual_seed(seed)
     np.random.seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
 
     # Determine dataset type from config
-    dataset_name = config.get('dataset', 'TinyStories')
+    dataset_name = config.dataset
     print(f"Dataset type: {dataset_name}")
     print(f"Fine-tuning mode: {args.mode.upper()}")
 
     # Load appropriate tokenizer based on dataset
     tokenizer = Tokenizer.from_files(
-        vocab_filepath=config['vocab_file'],
-        merges_filepath=config['merges_file'],
-        special_tokens=config.get('special_tokens', ['<|endoftext|>'])
+        vocab_filepath=config.vocab_file,
+        merges_filepath=config.merges_file,
+        special_tokens=config.special_tokens
     )
 
     vocab_size = len(tokenizer.decoder_vocab)
     print(f"Vocabulary size: {vocab_size:,}")
 
+    # Update config with actual vocab_size
+    config.vocab_size = vocab_size
+
     # Load and prepare fine-tuning data (online tokenization - no preprocessing)
     raw_conversations = load_sft_data(args.data_path, args.max_samples)
-    dataset = SFTDataset(raw_conversations, tokenizer, config['context_length'])
+    dataset = SFTDataset(raw_conversations, tokenizer, config.context_length)
 
     # Initialize model
-    use_amp = config.get('use_amp', False)
+    use_amp = config.use_amp
     model_dtype = torch.float32
 
     model = TransformerLM(
-        vocab_size=vocab_size,
-        context_length=config['context_length'],
-        d_model=config['d_model'],
-        num_layers=config['num_layers'],
-        num_heads=config['num_heads'],
-        d_ff=config['d_ff'],
-        rope_theta=config['rope_theta'],
-        drop_p=config.get('dropout', 0.0),
-        use_moe=config.get('use_moe', False),
-        moe_layers=config.get('moe_layers', None),
-        n_routed_experts=config.get('n_routed_experts', 8),
-        num_experts_per_tok=config.get('num_experts_per_tok', 2),
-        n_shared_experts=config.get('n_shared_experts', 0),
-        aux_seq_loss_alpha=config.get('aux_seq_loss_alpha', 0.0),
-        bias_update_speed=config.get('bias_update_speed', 0.01),
-        num_kv_heads=config.get('num_kv_heads', config['num_heads']),
-        attention_type=config.get('attention_type', 'GQA'),
-        d_rope=config.get('d_rope', None),
-        kv_lora_rank=config.get('kv_lora_rank', None),
-        q_lora_rank=config.get('q_lora_rank', None),
+        config=config,
         device=device,
         dtype=model_dtype
     ).to(device)
 
     # Print model configuration
-    attention_type = config.get('attention_type', 'GQA')
-    mlp_type = 'MoE' if config.get('use_moe', False) else 'FFN'
+    attention_type = config.attention_type
+    mlp_type = 'MoE' if config.use_moe else 'FFN'
     print(f"ATT Type: [{attention_type}]   MLP Type: [{mlp_type}]")
 
     # Load pretrained checkpoint
@@ -332,9 +316,9 @@ def main():
     optimizer = AdamW(
         optimizer_params,
         lr=args.learning_rate,
-        betas=(config['beta1'], config['beta2']),
-        eps=config['eps'],
-        weight_decay=config.get('weight_decay', 0.1),
+        betas=(config.beta1, config.beta2),
+        eps=config.eps,
+        weight_decay=config.weight_decay,
         fused=True
     )
 
@@ -380,10 +364,10 @@ def main():
         'accumulation_steps': args.accumulation_steps,
         'effective_batch_size': args.batch_size * args.accumulation_steps,
         'warmup_iters': args.warmup_iters,
-        'context_length': config['context_length'],
+        'context_length': config.context_length,
         'total_params': total_params,
         'trainable_params': trainable_params_count,
-        **config
+        **config.to_dict()
     }
 
     if args.mode == 'lora':

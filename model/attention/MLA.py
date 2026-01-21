@@ -16,19 +16,6 @@ class MultiHeadLatentAttention(nn.Module):
     1. Low-rank compression of KV cache to reduce memory usage
     2. Decoupled RoPE: Split into RoPE part and non-RoPE part, concatenate after RoPE
     3. Gating mechanism for multi-head attention output
-
-    Args:
-        d_model: Model dimension
-        num_heads: Number of attention heads
-        rope: Rotary Position Embedding module
-        d_rope: Dimension for RoPE (default: 8)
-        kv_lora_rank: Rank for KV compression (default: d_model // 2)
-        q_lora_rank:  Rank for non-RoPE query compression (default: kv_lora_rank)
-        use_gate: Whether to use head-wise gating mechanism (default: True)
-        cache_enabled: Whether to enable KV caching for inference (default: False)
-        max_batch_size: Maximum batch size for KV cache (default: 4)
-        max_seq_len: Maximum sequence length for KV cache (default: 2048)
-        device: Device for parameters
     """
 
     def __init__(

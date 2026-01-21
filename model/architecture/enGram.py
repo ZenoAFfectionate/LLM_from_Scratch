@@ -228,7 +228,7 @@ class Engram(nn.Module):
             n_embed_per_ngram = embd_dim_per_ngram,
             n_head_per_ngram  = head_num_per_ngram,
             layer_ids = layer_ids,
-            tokenizer_name_or_path=tokenizer_path,
+            tokenizer_path=tokenizer_path,
             pad_id = pad_id,
             seed = seed,
         )

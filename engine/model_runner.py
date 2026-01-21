@@ -4,47 +4,67 @@ import torch.distributed as dist
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
-from nanovllm.config import Config
-from nanovllm.engine.sequence import Sequence
-from nanovllm.models.qwen3 import Qwen3ForCausalLM
-from nanovllm.layers.sampler import Sampler
-from nanovllm.utils.context import set_context, get_context, reset_context
-from nanovllm.utils.loader import load_model
+from model.config import Config
+from engine.sequence import Sequence
+from model.transformer import TransformerLM
+from utils.sampler import Sampler
+from utils.context import set_context, get_context, reset_context
+from utils.loader import load_model
 
 
 class ModelRunner:
     """
-    
+    Model runner for inference with TransformerLM.
+
+    This class handles:
+    - Model initialization and weight loading
+    - KV cache allocation and management
+    - Prefill and decode phases
+    - Multi-GPU coordination (tensor parallelism)
+    - CUDA graph capturing for efficient decoding
     """
 
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
         self.config = config
-        hf_config = config.hf_config
-        self.block_size = config.kvcache_block_size
-        self.enforce_eager = config.enforce_eager
-        self.world_size = config.tensor_parallel_size
+        self.block_size = getattr(config, 'kvcache_block_size', 256)
+        self.enforce_eager = getattr(config, 'enforce_eager', True)
+        self.world_size = getattr(config, 'tensor_parallel_size', 1)
         self.rank = rank
         self.event = event
-        # initialize NCCL process group for inter-GPU communication
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+
+        # Initialize NCCL process group for inter-GPU communication
+        if self.world_size > 1:
+            dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
-        # specify default dtype and device for model
+
+        # Specify default dtype and device for model
         default_dtype = torch.get_default_dtype()
-        torch.set_default_dtype(hf_config.torch_dtype)
+        model_dtype = getattr(config, 'torch_dtype', torch.float32)
+        if isinstance(model_dtype, str):
+            model_dtype = getattr(torch, model_dtype, torch.float32)
+        torch.set_default_dtype(model_dtype)
         torch.set_default_device("cuda")
 
-        self.model = Qwen3ForCausalLM(hf_config)
-        load_model(self.model, config.model)
+        # Initialize model
+        self.model = TransformerLM(config=config, device="cuda", dtype=model_dtype)
+
+        # Load model weights
+        model_path = getattr(config, 'checkpoint_path', None) or getattr(config, 'model', None)
+        if model_path:
+            load_model(self.model, model_path)
+
         self.sampler = Sampler()
-        # phase-based setup:
+
+        # Phase-based setup
         self.warmup_model()
         self.allocate_kv_cache()
         if not self.enforce_eager:
             self.capture_cudagraph()
+
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
-        # share memory setup for multi-GPU coordination
+        # Shared memory setup for multi-GPU coordination
         if self.world_size > 1:
             if rank == 0:
                 self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
@@ -63,7 +83,8 @@ class ModelRunner:
         if not self.enforce_eager:
             del self.graphs, self.graph_pool
         torch.cuda.synchronize()
-        dist.destroy_process_group()
+        if self.world_size > 1:
+            dist.destroy_process_group()
 
     def loop(self):
         while True:
@@ -98,31 +119,58 @@ class ModelRunner:
     def warmup_model(self):
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
-        max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
-        num_seqs = min(max_num_batched_tokens // max_model_len, self.config.max_num_seqs)
+        max_num_batched_tokens = getattr(self.config, 'max_num_batched_tokens', 16384)
+        max_model_len = getattr(self.config, 'max_model_len', self.config.context_length)
+        max_num_seqs = getattr(self.config, 'max_num_seqs', 512)
+        num_seqs = min(max_num_batched_tokens // max_model_len, max_num_seqs)
         seqs = [Sequence([0] * max_model_len) for _ in range(num_seqs)]
         self.run(seqs, True)
         torch.cuda.empty_cache()
 
     def allocate_kv_cache(self):
         config = self.config
-        hf_config = config.hf_config
         free, total = torch.cuda.mem_get_info()
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size
-        head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.torch_dtype.itemsize
-        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
-        assert config.num_kvcache_blocks > 0
-        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+
+        # Get model dimensions from config
+        num_layers = config.num_layers
+        num_kv_heads = getattr(config, 'num_kv_heads', config.num_heads) // self.world_size
+        head_dim = config.d_model // config.num_heads
+
+        # Get dtype size
+        model_dtype = getattr(config, 'torch_dtype', torch.float32)
+        if isinstance(model_dtype, str):
+            model_dtype = getattr(torch, model_dtype, torch.float32)
+        dtype_size = torch.tensor([], dtype=model_dtype).element_size()
+
+        block_bytes = 2 * num_layers * self.block_size * num_kv_heads * head_dim * dtype_size
+        gpu_memory_utilization = getattr(config, 'gpu_memory_utilization', 0.9)
+        num_kvcache_blocks = int(total * gpu_memory_utilization - used - peak + current) // block_bytes
+
+        if num_kvcache_blocks <= 0:
+            print("Warning: Not enough memory for KV cache, using minimal allocation")
+            num_kvcache_blocks = 1
+
+        # Store for later use
+        self.num_kvcache_blocks = num_kvcache_blocks
+
+        # Allocate KV cache tensor
+        self.kv_cache = torch.empty(
+            2, num_layers, num_kvcache_blocks, self.block_size, num_kv_heads, head_dim,
+            device="cuda", dtype=model_dtype
+        )
+
+        # Assign KV cache to attention layers
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
+
+        print(f"Allocated KV cache: {num_kvcache_blocks} blocks, {layer_id} layers")
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
@@ -139,6 +187,7 @@ class ModelRunner:
         max_seqlen_k = 0
         slot_mapping = []
         block_tables = None
+
         for seq in seqs:
             seqlen = len(seq)
             input_ids.extend(seq[seq.num_cached_tokens:])
@@ -156,10 +205,12 @@ class ModelRunner:
                 if i != seq.num_blocks - 1:
                     end = start + self.block_size
                 else:
-                    end = start + seq.last_block_num_tokens 
+                    end = start + seq.last_block_num_tokens
                 slot_mapping.extend(list(range(start, end)))
+
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
+
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -173,11 +224,13 @@ class ModelRunner:
         positions = []
         slot_mapping = []
         context_lens = []
+
         for seq in seqs:
             input_ids.append(seq.last_token)
             positions.append(len(seq) - 1)
             context_lens.append(len(seq))
-            slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
+            slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1)
+
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -195,9 +248,38 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
+        """
+        Run the model forward pass.
+
+        Note: TransformerLM returns logits directly, unlike Qwen3ForCausalLM which
+        has separate forward() and compute_logits() methods.
+        """
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
-            return self.model.compute_logits(self.model(input_ids, positions))
+            # For TransformerLM: reshape to (batch, seq_len) if needed
+            if input_ids.dim() == 1:
+                # For prefill: use the context to determine sequence boundaries
+                context = get_context()
+                if context.cu_seqlens_q is not None and len(context.cu_seqlens_q) > 1:
+                    # Variable length sequences - process each sequence
+                    logits_list = []
+                    cu_seqlens = context.cu_seqlens_q.tolist()
+                    for i in range(len(cu_seqlens) - 1):
+                        start, end = cu_seqlens[i], cu_seqlens[i + 1]
+                        seq_input = input_ids[start:end].unsqueeze(0)
+                        seq_logits = self.model(seq_input)
+                        # Get last token logits for each sequence
+                        logits_list.append(seq_logits[:, -1, :])
+                    return torch.cat(logits_list, dim=0)
+                else:
+                    # Single sequence or batch with same length
+                    input_ids = input_ids.unsqueeze(0)
+                    logits = self.model(input_ids)
+                    return logits[:, -1, :]  # Last token logits
+            else:
+                logits = self.model(input_ids)
+                return logits[:, -1, :]
         else:
+            # CUDA graph path for decode
             bs = input_ids.size(0)
             context = get_context()
             graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
@@ -210,7 +292,7 @@ class ModelRunner:
             graph_vars["context_lens"][:bs] = context.context_lens
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
             graph.replay()
-            return self.model.compute_logits(graph_vars["outputs"][:bs])
+            return graph_vars["outputs"][:bs]
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
@@ -222,16 +304,20 @@ class ModelRunner:
 
     @torch.inference_mode()
     def capture_cudagraph(self):
-        config = self.config
-        hf_config = config.hf_config
-        max_bs = min(self.config.max_num_seqs, 512)
-        max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
-        input_ids = torch.zeros(max_bs, dtype=torch.int64)
-        positions = torch.zeros(max_bs, dtype=torch.int64)
-        slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
-        context_lens = torch.zeros(max_bs, dtype=torch.int32)
-        block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
-        outputs = torch.zeros(max_bs, hf_config.hidden_size)
+        """Capture CUDA graphs for efficient decode phase."""
+        max_num_seqs = getattr(self.config, 'max_num_seqs', 512)
+        max_model_len = getattr(self.config, 'max_model_len', self.config.context_length)
+
+        max_bs = min(max_num_seqs, 512)
+        max_num_blocks = (max_model_len + self.block_size - 1) // self.block_size
+
+        input_ids = torch.zeros(max_bs, dtype=torch.int64, device="cuda")
+        positions = torch.zeros(max_bs, dtype=torch.int64, device="cuda")
+        slot_mapping = torch.zeros(max_bs, dtype=torch.int32, device="cuda")
+        context_lens = torch.zeros(max_bs, dtype=torch.int32, device="cuda")
+        block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32, device="cuda")
+        outputs = torch.zeros(max_bs, self.config.vocab_size, device="cuda")
+
         self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         self.graphs = {}
         self.graph_pool = None
@@ -239,9 +325,17 @@ class ModelRunner:
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
             set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
-            outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
+
+            # Warmup - TransformerLM expects (batch, seq_len), decode uses (batch, 1)
+            batch_input = input_ids[:bs].unsqueeze(1)  # Shape: (bs, 1)
+            warmup_output = self.model(batch_input)
+            outputs[:bs] = warmup_output[:, -1, :]
+
             with torch.cuda.graph(graph, self.graph_pool):
-                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
+                batch_input = input_ids[:bs].unsqueeze(1)
+                graph_output = self.model(batch_input)
+                outputs[:bs] = graph_output[:, -1, :]
+
             if self.graph_pool is None:
                 self.graph_pool = graph.pool()
             self.graphs[bs] = graph

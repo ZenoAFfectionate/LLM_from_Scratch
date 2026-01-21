@@ -26,10 +26,55 @@ For inference optimization, we implemented efficient KV cache mechanisms that en
 
 ## Table of Contents
 
-
+- [Overview](#overview)
+  - [Project Evolution and Technical Journey](#project-evolution-and-technical-journey)
+- [To Do List](#to-do-list)
+- [Quick Start](#quick-start)
+- [Dataset Introduction](#dataset-introduction)
+  - [Pre-training Datasets](#pre-training-datasets)
+  - [Fine-tuning Datasets](#fine-tuning-datasets-ultrachat-derived)
+  - [Data Format Specifications](#data-format-specifications)
+- [Model Architecture](#model-architecture)
+  - [BPE Tokenizer](#bpe-tokenizer)
+  - [Rotary Positional Embedding](#rotary-positional-embedding)
+  - [Muon Optimizer](#muon-optimizer)
+  - [Attention Mechanism](#attention-mechanism) (MHA, GQA, MLA, DSA, Gating)
+  - [Conditional Computation: MoE Architecture](#conditional-computation-moe-architecture)
+  - [Conditional Memory: EnGram Architecture](#conditional-memory-engram-architecture)
+- [Model Configuration](#model-configuration)
+  - [TinyStories-based Model](#tinystories-based-model)
+  - [OpenWebText-based Model](#openwebtext-based-model)
+- [Model Optimization](#model-optimization)
+  - [RMSNorm Modification](#rmsnorm-modification)
+  - [DataLoad Optimization](#dataload-optimization)
+  - [Mixed-Precision Training](#mixed-precision-training)
+  - [Model Performance Analysis](#model-performance-analysis)
+  - [MoE Optimization](#moe-optimization)
+- [Experiment Results](#experiment-results)
+- [References](#references)
+- [License](#license)
 
 ---
 
+## To Do List
+
+[ ] Implement Tensor Parallelism (TP) and Expert Parallelism (EP) strategies for the Mixture-of-Experts (MoE) module.
+
+[ ] Integrate the Multi-Head Compression (mHC) residual connection proposed by DeepSeek upon the release of their reference implementation.
+
+[ ] Establish a complete training pipeline supporting model optimization using the Muon optimizer.
+
+[ ] Integrate the enGram module to train a hybrid MLA+MoE+enGram architecture, optimizing performance with custom CUDA kernels.
+
+[ ] Refactor DSA.py to distinguish execution logic between training and inference phases.
+
+[ ] Implement DeepSeek-v3.2-inspired DSA training on top of MLA, capturing top-k indices and attention scores for a two-stage loss calculation.
+
+[ ] Adapt engine/model_runner.py to ensure compatibility with the updated model architecture.
+
+[ ] Develop custom KV-cache Triton kernels to support and optimize various attention mechanisms.
+
+---
 
 ## Quick Start
 

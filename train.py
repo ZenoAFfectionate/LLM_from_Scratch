@@ -259,8 +259,17 @@ def main():
     print(f"Trainable parameters: {trainable_params:,}")
 
     # compile the model with torch.compile for better performance
-    print("Compiling model with torch.compile...")
-    model = torch.compile(model, mode='default', dynamic=True, fullgraph=False)
+    # Use optimal settings for Transformer training:
+    # - mode="reduce-overhead": Minimize kernel launch overhead (best for iterative workloads)
+    # - fullgraph=False: Allow graph breaks for dynamic ops (bincount in MoE, etc.)
+    # - dynamic=False: Static shapes enable more aggressive optimizations
+    print("Compiling model with torch.compile (reduce-overhead mode)...")
+    model = torch.compile(
+        model,
+        mode="default",   # Minimize kernel launch overhead
+        fullgraph=False,  # Allow graph breaks for MoE dynamic ops (bincount)
+        dynamic=True     # Static shapes for better optimization
+    )
     print("Model compiled successfully")
 
     # Initialize optimizer

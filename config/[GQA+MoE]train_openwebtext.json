@@ -38,7 +38,7 @@
     "aux_seq_loss_alpha": 0.01,
     "bias_update_speed": 0.01,
     "num_kv_heads": 8,
-    "batch_size": 8,
+    "batch_size": 16,
     "max_iterations": 50000,
     "max_lr": 2e-04,
     "min_lr": 2e-05,
@@ -48,9 +48,9 @@
     "eps": 1e-08,
     "weight_decay": 0.1,
     "max_grad_norm": 1.0,
-    "log_interval": 100,
+    "log_interval": 1,
     "eval_interval": 1000,
-    "eval_batches": 1600,
+    "eval_batches": 800,
     "checkpoint_dir": "/home/kemove/Courses/STF_LLM/Assignment_1/checkpoints",
     "use_amp": true
 }

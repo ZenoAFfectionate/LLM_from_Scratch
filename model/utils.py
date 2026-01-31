@@ -53,14 +53,15 @@ class RMSNorm(nn.Module):
         dtype = x.dtype
         if residual is None:
             x = x.float()
-            var = x.pow(2).mean(-1, keepdim=True)
-            x = x * torch.rsqrt(var + self.eps)
-            return (self.weight * x).to(dtype)
+            # [OPT] Use rsqrt of mean(x^2) directly, avoid storing intermediate pow result
+            rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+            return (self.weight * x * rms).to(dtype)
         else:
-            x = residual = x.float() + residual.float()
-            var = x.pow(2).mean(-1, keepdim=True)
-            x = x * torch.rsqrt(var + self.eps)
-            return (self.weight * x).to(dtype), residual.to(dtype)
+            # [OPT] Use add_ for in-place addition on new tensor (safe for autograd)
+            x = x.float().add_(residual.float())
+            residual = x  # share memory, no copy needed
+            rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+            return (self.weight * x * rms).to(dtype), residual.to(dtype)
 
 
 # ---------------------------------------------------
@@ -77,14 +78,16 @@ def cross_entropy(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         torch.Tensor: The computed cross-entropy loss as a scalar tensor.
 
     Note:
-        Using F.cross_entropy for full torch.compile + AMP compatibility.
+        Using F.log_softmax for full torch.compile + AMP compatibility.
         Native implementation handles mixed precision and compile optimization automatically.
     """
-    logits = logits - logits.amax(dim=-1, keepdim=True)
-    # Step 1: Compute log-softmax of logits for numerical stability
-    predic_probs = logits - torch.log(torch.exp(logits).sum(dim=-1, keepdim=True))
+    # [OPT] Use F.log_softmax to fuse log + softmax, avoiding temporary tensors
+    # This replaces: logits - logits.amax() -> exp() -> sum() -> log() -> subtract
+    # with a single fused kernel that is numerically stable
+    import torch.nn.functional as F
+    log_probs = F.log_softmax(logits, dim=-1)
     # Step 2: Gather the log probabilities corresponding to the target labels
-    target_probs = predic_probs.gather(dim=-1, index=target.unsqueeze(-1))
+    target_probs = log_probs.gather(dim=-1, index=target.unsqueeze(-1))
     # Step 3: Compute the negative log likelihood loss
     return -target_probs.squeeze(-1).mean()
 

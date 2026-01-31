@@ -1,53 +1,15 @@
 import math
 import torch
-import triton
-
 import torch.nn as nn
-import triton.language as tl
 import torch.nn.functional as F
 
 from model.architecture.mlp import MLP
-
-
-class FusedSharedExperts(nn.Module):
-    """
-    Fused implementation of multiple shared experts. Instead of running N separate experts
-    sequentially (launch N kernel), we fuse them into one larger expert and split outputs.d
-
-    Example: 2 experts × (d_model → d_ff → d_model) becomes:
-             1 expert × (d_model → 2*d_ff → d_model)
-
-    Benefits:
-    - Reduces CUDA kernel launch overhead by N×
-    - Better memory coalescing and cache utilization
-    - Single large matmul is more efficient than N small matmuls
-    """
-    def __init__(self, d_model: int, d_ff: int, n_shared_experts: int, device=None, dtype=None):
-        super().__init__()
-        self.d_model = d_model
-        self.d_ff = d_ff
-        self.n_shared_experts = n_shared_experts
-
-        # fused linear layers with expanded dimensions
-        fused_d_ff = d_ff * n_shared_experts
-        self.w1 = nn.Linear(d_model, fused_d_ff, device=device, dtype=dtype)
-        self.w3 = nn.Linear(d_model, fused_d_ff, device=device, dtype=dtype)
-        self.w2 = nn.Linear(fused_d_ff, d_model, device=device, dtype=dtype)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass through fused shared experts. The computation is equivalent 
-        to summing N individual experts but done in a single pass for efficiency.
-        """
-        # Single forward pass through fused dimensions
-        w1_out = self.w1(x)  # (batch, seq, d_ff * n_experts)
-        w3_out = self.w3(x)  # (batch, seq, d_ff * n_experts)
-        activated = F.silu(w1_out) * w3_out
-        return self.w2(activated)  # (batch, seq, d_model)
+from model.architecture.moe_kernels import fused_scatter_add_weighted
 
 
 class Gate(nn.Module):
     """ PyTorch implementation of MoE Gate mechanism with Auxiliary-Loss-Free Load Balancing """
+
     def __init__(
         self,
         hidden_size: int,
@@ -205,17 +167,9 @@ class MOE(nn.Module):
             device=device,
             dtype=dtype
         )
-        # use FusedSharedExperts if shared experts are more than 1
-        if n_shared_experts > 1:
-            self.shared_experts = FusedSharedExperts(
-                d_model=d_model,
-                d_ff=d_ff,
-                n_shared_experts=n_shared_experts,
-                device=device,
-                dtype=dtype
-            )
-        elif n_shared_experts == 1:
-            self.shared_experts = MLP(d_model, d_ff, device=device, dtype=dtype)
+        # Initialize shared expert (single MLP)
+        if n_shared_experts > 0:
+            self.shared_expert = MLP(d_model, d_ff, device=device, dtype=dtype)
 
     def forward(self, x):
         identity = x
@@ -243,23 +197,21 @@ class MOE(nn.Module):
             sorted_token_idx = token_indices[sorted_expert_idx]   # which original token
             sorted_weights = flat_topk_weight[sorted_expert_idx]  # corresponding weights
 
-            # permute input tokens to match expert grouping (contiguous memory access)
-            sorted_tokens = x_flat[sorted_token_idx]  # (batch*seq*top_k, d_model)
+            # permute tokens to match expert group for contiguous memory access
+            sorted_tokens = x_flat[sorted_token_idx]
 
             # count how many tokens each expert processes (n_routed_experts,)
             expert_token_counts = torch.bincount(
                 flat_topk_idx, minlength=self.n_routed_experts
             )
-
             # compute cumulative offsets: [0, count[0], count[0]+count[1], ...]
             token_offsets = torch.cat([
                 torch.tensor([0], device=x_flat.device, dtype=torch.long),
                 torch.cumsum(expert_token_counts, dim=0)
             ])
 
-            y_sorted = torch.zeros_like(sorted_tokens)  # allocate output buffer
-
-            # handle each expert's chunk sequentially
+            # Allocate output buffer for raw expert outputs (without weights)
+            y_sorted = torch.zeros_like(sorted_tokens)
             for expert_id in range(self.n_routed_experts):
                 start_idx = token_offsets[expert_id]
                 end_idx = token_offsets[expert_id + 1]
@@ -267,21 +219,23 @@ class MOE(nn.Module):
                 # skip if no tokens assigned to this expert
                 if start_idx == end_idx: continue
 
-                # extract contiguous chunk (excellent cache locality!)
+                # extract contiguous chunk for locality
                 expert_input = sorted_tokens[start_idx:end_idx]
-                # single forward pass through expert
-                expert_output = self.experts[expert_id](expert_input)
-                # weight the expert output
-                weights = sorted_weights[start_idx:end_idx].unsqueeze(-1)
-                y_sorted[start_idx:end_idx] = expert_output * weights
+                # single forward pass through expert - store RAW output (no weight multiplication)
+                y_sorted[start_idx:end_idx] = self.experts[expert_id](expert_input)
 
-            # un-sort the results to match original token order and accumulate
-            # when multiple experts contribute to same token (top_k > 1)
-            y_flat = torch.zeros(n_total_tokens, self.d_model, device=x_flat.device, dtype=x_flat.dtype)
-            # expand sorted_token_idx for scatter operation
-            sorted_token_idx_expanded = sorted_token_idx.unsqueeze(-1).expand_as(y_sorted)
-            # scatter-add to accumulate contributions from multiple experts to same token
-            y_flat.scatter_add(0, sorted_token_idx_expanded, y_sorted)
+            # Fused Triton kernel: weight multiplication + scatter-add using segment reduction
+            # This is MUCH faster than atomic scatter-add because:
+            #   1. Re-sorts by target token to enable contiguous segment access
+            #   2. Uses segment reduction (no atomics!) - each output token sums its segment
+            #   3. Fully coalesced reads and writes
+            y_flat = fused_scatter_add_weighted(
+                y_sorted,           # raw expert outputs
+                sorted_token_idx,   # target token indices
+                sorted_weights,     # routing weights
+                n_total_tokens,     # number of original tokens
+                self.num_experts_per_tok  # top_k for segment loop unrolling
+            )
 
             y = y_flat.view(batch_size, seq_len, -1)
         else:
@@ -289,9 +243,9 @@ class MOE(nn.Module):
             y = self.moe_infer(x_flat, flat_topk_idx, topk_weight.view(-1, 1))
             y = y.view(batch_size, seq_len, -1)
 
-        # apply fused shared experts and add to output
+        # Apply shared expert and add to output
         if self.n_shared_experts > 0:
-            y = y + self.shared_experts(identity)
+            y = y + self.shared_expert(identity)
 
         self.aux_loss = aux_seq_loss
         self._total_tokens = batch_size * seq_len

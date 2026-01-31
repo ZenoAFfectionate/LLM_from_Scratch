@@ -39,10 +39,10 @@ class RotaryPositionalEmbedding(nn.Module):
         cos_sin = cos_sin.view(*([1] * (x.ndim - 2)), *cos_sin.shape)
         cos, sin = torch.chunk(cos_sin, 2, dim=-1)  # split back to sin and cos
         # peform rotary positional embedding for x
-        x1, x2 = torch.chunk(x.float(), 2, dim=-1)
-        y1 = x1 * cos - x2 * sin  # rotate 1st half
-        y2 = x2 * cos + x1 * sin  # rotate 2nd half
-        return torch.cat((y1, y2), dim=-1).to(x.dtype)
+        x1, x2 = torch.chunk(x, 2, dim=-1)
+        y1 = torch.addcmul(x1 * cos, x2, sin, value=-1)
+        y2 = torch.addcmul(x2 * cos, x1, sin, value=+1)
+        return torch.cat((y1, y2), dim=-1)
 
 
 # ---------------------------------------------------

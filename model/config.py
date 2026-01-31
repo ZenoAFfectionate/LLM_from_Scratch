@@ -97,7 +97,7 @@ class Config:
     def __init__(
         self,
         # Model architecture
-        vocab_size: int = 50257,
+        vocab_size: int = 32000,
         context_length: int = 2048,
         d_model: int = 768,
         num_layers: int = 12,

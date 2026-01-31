@@ -50,14 +50,22 @@ class MultiHeadLatentAttention(nn.Module):
         self.q_lora_rank  = q_lora_rank  if q_lora_rank  is not None else self.kv_lora_rank
 
         # q projection path with explicit dtype:
+        # Fused projection: combine q_nope and q_rope up-projections into single matmul
         self.q_down_proj = nn.Linear(d_model, self.q_lora_rank, device=device, dtype=dtype)
-        self.q_nope_up_proj = nn.Linear(self.q_lora_rank, d_model, device=device, dtype=dtype)
-        self.q_rope_up_proj = nn.Linear(self.q_lora_rank, head_num*self.rope_dim, device=device, dtype=dtype)
+        self.q_up_proj_fused = nn.Linear(
+            self.q_lora_rank, 
+            d_model + head_num * self.rope_dim,  # nope (d_model) + rope (head_num * rope_dim)
+            device=device, dtype=dtype
+        )
 
         # kv projection path with explicit dtype:
+        # Fused projection: combine k_up and v_up projections into single matmul
         self.kv_down_proj = nn.Linear(d_model, self.kv_lora_rank, device=device, dtype=dtype)
-        self.k_up_proj = nn.Linear(self.kv_lora_rank, d_model, device=device, dtype=dtype)
-        self.v_up_proj = nn.Linear(self.kv_lora_rank, d_model, device=device, dtype=dtype)
+        self.kv_up_proj_fused = nn.Linear(
+            self.kv_lora_rank,
+            2 * d_model,  # k_nope (d_model) + v (d_model)
+            device=device, dtype=dtype
+        )
         self.k_rope_proj = nn.Linear(d_model, self.rope_dim, device=device, dtype=dtype)
 
         # initalize normalization and output projection (RMSNorm uses FP32 internally)
@@ -104,8 +112,9 @@ class MultiHeadLatentAttention(nn.Module):
         # Process Q
         # =========
         q_compressed = self.q_norm(self.q_down_proj(x))  # (bsz, seq_len, q_lora_rank)
-        q_nope = self.q_nope_up_proj(q_compressed).view(batch, seq_len, self.num_heads, self.head_dim)
-        q_rope = self.q_rope_up_proj(q_compressed).view(batch, seq_len, self.num_heads, self.rope_dim)
+        q_fused = self.q_up_proj_fused(q_compressed)     # (bsz, seq_len, d_model + head_num * rope_dim)
+        q_nope = q_fused[..., :self.d_model].view(batch, seq_len, self.num_heads, self.head_dim)
+        q_rope = q_fused[..., self.d_model:].view(batch, seq_len, self.num_heads, self.rope_dim)
 
         q_rope = q_rope.transpose(1, 2)  # (bsz, num_heads, seq_len, d_rope)
         q_rope = self.rope(q_rope, token_positions)  # apply RoPE
@@ -134,9 +143,11 @@ class MultiHeadLatentAttention(nn.Module):
             cached_kv = self.kv_cache[:batch, :max_cached_len, :]
             cached_pe = self.pe_cache[:batch, :max_cached_len, :]
 
-            # reshape martix to enable efficient einsum
-            w_uk = self.k_up_proj.weight.view(self.num_heads, self.head_dim, self.kv_lora_rank)
-            w_uv = self.v_up_proj.weight.view(self.num_heads, self.head_dim, self.kv_lora_rank)
+            # reshape matrix to enable efficient einsum (extract from fused weights)
+            # kv_up_proj_fused.weight shape: (2 * d_model, kv_lora_rank)
+            # first d_model rows: k_nope weights, last d_model rows: v weights
+            w_uk = self.kv_up_proj_fused.weight[:self.d_model, :].view(self.num_heads, self.head_dim, self.kv_lora_rank)
+            w_uv = self.kv_up_proj_fused.weight[self.d_model:, :].view(self.num_heads, self.head_dim, self.kv_lora_rank)
 
             # absorb w_uk into q and compute attention score
             q_absorbed = torch.einsum('bqhd, hdk -> bqhk', q_nope, w_uk)
@@ -167,11 +178,13 @@ class MultiHeadLatentAttention(nn.Module):
             attn_output = torch.einsum('bhqk, hdk -> bqhd', attn_latent, w_uv)
         
         # ==============================
-        # Training: separate computation
+        # Training: fused computation
         # ==============================
         else:
-            k_nope = self.k_up_proj(kv_compressed).view(batch, seq_len, self.num_heads, self.head_dim)
-            v = self.v_up_proj(kv_compressed).view(batch, seq_len, self.num_heads, self.head_dim)
+            # Fused projection: single matmul instead of two separate k_up and v_up
+            kv_fused = self.kv_up_proj_fused(kv_compressed)  # (bsz, seq_len, 2 * d_model)
+            k_nope = kv_fused[..., :self.d_model].view(batch, seq_len, self.num_heads, self.head_dim)
+            v = kv_fused[..., self.d_model:].view(batch, seq_len, self.num_heads, self.head_dim)
 
             # replicate k_rope to match each head and concatenate with k_nope
             k_rope = k_rope.unsqueeze(2).expand(batch, seq_len, self.num_heads, self.rope_dim)
@@ -182,6 +195,7 @@ class MultiHeadLatentAttention(nn.Module):
             k = k.transpose(1, 2)  # (bsz, num_heads, seq_len, head_dim+rope_dim)
             v = v.transpose(1, 2)  # (bsz, num_heads, seq_len, head_dim)
 
+            # Use scaled_dot_product_attention which automatically selects the fastest
             attn_output = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
             attn_output = attn_output.transpose(1, 2)  # (bsz, seq_len, num_heads, head_dim)
 

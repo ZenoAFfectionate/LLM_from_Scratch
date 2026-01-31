@@ -1,21 +1,7 @@
-"""
-Triton Kernels for Mixture-of-Experts
-
-This module provides optimized Triton kernels for MoE operations:
-- Segment Reduction: Efficient weighted scatter-add without atomic operations
-
-The segment reduction approach re-sorts data by target token to enable 
-contiguous memory access and avoid atomic contention.
-"""
-
 import torch
 import triton
 import triton.language as tl
 
-
-# =============================================================================
-#  Segment Reduction Kernel: Weighted accumulation back to original positions
-# =============================================================================
 
 @triton.jit
 def _segment_reduce_weighted_kernel(
@@ -82,10 +68,6 @@ def _segment_reduce_weighted_kernel(
     # Note: the dtype is inferred from the output pointer type
     tl.store(y_flat_ptr + token_id * stride_y_row + d_offs, acc, mask=d_mask)
 
-
-# =============================================================================
-#  Python Wrapper Functions
-# =============================================================================
 
 def segment_reduce_weighted(
     expert_output: torch.Tensor,    # (num_sorted, d_model) - outputs sorted by target token

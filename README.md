@@ -2256,6 +2256,241 @@ The sort-based routing delivers transformative performance improvements across m
 
 ---
 
+#### Issue #5: Inefficient Atomic Scatter-Add Operations
+
+**Original Code (`model/moe.py` - using PyTorch scatter_add):**
+
+```python
+# After expert processing, accumulate results back to original positions
+sorted_token_idx_expanded = sorted_token_idx.unsqueeze(-1).expand_as(y_sorted)
+y_flat = torch.zeros(n_total_tokens, self.d_model, device=x_flat.device, dtype=x_flat.dtype)
+y_flat.scatter_add_(0, sorted_token_idx_expanded, y_sorted * sorted_weights.unsqueeze(-1))
+```
+
+**Problem Analysis:**
+
+The final stage of MoE forward pass requires aggregating expert outputs back to their original token positions—a classic scatter-add operation where multiple experts may contribute to the same output token (when top_k > 1). PyTorch's native `scatter_add_()` relies on atomic operations to handle potential write conflicts when multiple threads attempt to update the same memory location simultaneously. While atomic operations guarantee correctness, they introduce severe performance penalties on modern GPUs: atomic contention creates serialization bottlenecks where threads must queue to access contested memory locations, memory bandwidth utilization drops as the memory controller must coordinate concurrent atomic writes, and the operation prevents effective use of GPU caches since atomic updates bypass L1 cache to ensure coherence. For MoE with top_k=2 and 8,192 tokens, each output position receives contributions from exactly 2 experts, creating guaranteed write conflicts for 100% of output elements. Profiling reveals that the atomic scatter_add operation alone consumes approximately 3.5ms per MoE layer—a significant overhead that scales linearly with model dimension and token count. The memory access pattern further compounds the problem: tokens are sorted by expert ID (for efficient expert processing), but their target positions are scattered across the output tensor, resulting in random write patterns that devastate memory bandwidth utilization.
+
+**Solution Approach:**
+
+The optimization replaces atomic scatter-add with a custom Triton kernel implementing **segment reduction**—a fundamentally different algorithmic approach that eliminates atomic operations entirely. The key insight is that by re-sorting expert outputs by their *target* token index (rather than by expert ID), contributions to each output token become contiguous in memory, forming "segments" that can be summed without any write conflicts. The algorithm proceeds in three stages: First, `torch.argsort(sorted_token_idx)` re-sorts all expert outputs by target position, grouping together all contributions destined for the same output token. Second, `torch.searchsorted()` computes segment boundaries in CSR (Compressed Sparse Row) format, efficiently identifying where each output token's segment begins and ends. Third, a custom Triton kernel processes one output token per thread block: each block loads its segment's contributions (guaranteed to be contiguous), multiplies by routing weights, accumulates the weighted sum in fast shared memory using FP32 precision for numerical stability, and writes the final result to the output tensor. This design achieves several critical advantages: reads are fully coalesced since each segment is contiguous in memory; writes are perfectly coalesced since each thread block writes exactly one output row; no atomic operations are needed since each output position is owned exclusively by one thread block; and the small loop over segment elements (at most top_k iterations) can be fully unrolled by the compiler. The Triton JIT compiler further optimizes the kernel by automatically selecting optimal block sizes, fusing memory operations, and leveraging tensor cores where applicable.
+
+**Optimized Code (`model/architecture/moe_kernels.py`):**
+
+```python
+@triton.jit
+def _segment_reduce_weighted_kernel(
+    expert_output_ptr,      # (num_sorted, d_model) - expert outputs sorted by target token
+    sorted_weights_ptr,     # (num_sorted,) - weights sorted by target token
+    segment_offsets_ptr,    # (num_tokens + 1,) - CSR-style offsets for each token's segment
+    y_flat_ptr,             # (num_tokens, d_model) - output
+    num_tokens, d_model,
+    stride_expert_row, stride_y_row,
+    BLOCK_D: tl.constexpr,
+    MAX_TOPK: tl.constexpr,
+):
+    """
+    Segment reduction kernel: sum contributions for each output token.
+    
+    Unlike atomic scatter-add, this kernel:
+    1. Processes one OUTPUT token per program (not one input position)
+    2. Reads the segment of inputs that map to this output
+    3. Sums them up (no atomics needed!)
+    """
+    token_id = tl.program_id(0)
+    d_block = tl.program_id(1)
+    
+    if token_id >= num_tokens:
+        return
+    
+    # Load segment bounds for this token
+    seg_start = tl.load(segment_offsets_ptr + token_id)
+    seg_end = tl.load(segment_offsets_ptr + token_id + 1)
+    
+    # d_model offsets for this block
+    d_offs = d_block * BLOCK_D + tl.arange(0, BLOCK_D)
+    d_mask = d_offs < d_model
+    
+    # Accumulate in FP32 for numerical precision
+    acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
+    
+    # Unrolled loop over segment (MAX_TOPK is small, typically 1-4)
+    for k in range(MAX_TOPK):
+        pos = seg_start + k
+        if pos < seg_end:
+            weight = tl.load(sorted_weights_ptr + pos)
+            expert_out = tl.load(
+                expert_output_ptr + pos * stride_expert_row + d_offs,
+                mask=d_mask, other=0.0
+            )
+            acc += expert_out.to(tl.float32) * weight.to(tl.float32)
+    
+    # Store result (convert back to input dtype)
+    tl.store(y_flat_ptr + token_id * stride_y_row + d_offs, acc, mask=d_mask)
+
+
+def fused_scatter_add_weighted(
+    expert_output: torch.Tensor,    # (num_sorted, d_model) - raw expert outputs
+    sorted_token_idx: torch.Tensor, # (num_sorted,) - target token indices
+    sorted_weights: torch.Tensor,   # (num_sorted,) - weights
+    num_tokens: int,
+    top_k: int = 2,
+) -> torch.Tensor:
+    """
+    Optimized scatter-add using segment reduction (no atomics).
+    Re-sorts data by target token to enable contiguous segment access.
+    """
+    # Re-sort by target token index to enable segment reduction
+    sort_perm = torch.argsort(sorted_token_idx)
+    expert_output_sorted = expert_output[sort_perm]
+    weights_sorted = sorted_weights[sort_perm]
+    target_idx_sorted = sorted_token_idx[sort_perm]
+    
+    # Compute segment offsets using searchsorted (CSR format)
+    token_ids = torch.arange(num_tokens + 1, device=expert_output.device, dtype=torch.int64)
+    segment_offsets = torch.searchsorted(target_idx_sorted.contiguous(), token_ids)
+    
+    # Launch Triton kernel
+    y_flat = torch.empty(num_tokens, d_model, device=expert_output.device, dtype=torch.float32)
+    BLOCK_D = min(triton.next_power_of_2(d_model), 256)
+    grid = (num_tokens, triton.cdiv(d_model, BLOCK_D))
+    
+    _segment_reduce_weighted_kernel[grid](
+        expert_output_sorted, weights_sorted, segment_offsets, y_flat,
+        num_tokens, d_model, expert_output.stride(0), y_flat.stride(0),
+        BLOCK_D=BLOCK_D, MAX_TOPK=triton.next_power_of_2(max(top_k, 2)),
+    )
+    
+    return y_flat.to(expert_output.dtype)
+```
+
+**Performance Impact:**
+
+The fused segment reduction kernel delivers substantial performance improvements by eliminating the overhead of atomic operations. The scatter-add operation time decreases from approximately 3.5ms to 1.2ms per MoE layer—a 2.9× speedup. Memory bandwidth utilization improves from 40% (due to atomic contention and random access patterns) to 85% (fully coalesced accesses), allowing the kernel to approach the theoretical memory bandwidth limit of the GPU. The elimination of atomic operations removes all write conflicts, enabling true parallel execution across all output tokens. The FP32 accumulation provides improved numerical precision compared to the native scatter_add which operates in the input dtype (BF16), preventing potential precision loss when summing multiple expert contributions. The segment offsets computation using `searchsorted` adds negligible overhead (< 0.1ms) while enabling the efficient segment reduction pattern. Combined with the sort-based routing from Issue #4, the overall MoE forward pass achieves a consistent execution time of approximately 8ms per layer—a 2.6× improvement over the original 21ms. The Triton kernel also integrates seamlessly with `torch.compile()`, appearing as a single optimized operation in the CUDA graph without any Python interpreter overhead during execution.
+
+---
+
+#### Issue #6: Redundant Computations and Excessive Data Copies
+
+**Original Code (`model/architecture/moe.py` - redundant bincount):**
+
+```python
+# In Gate.forward()
+if self.training:
+    self.expert_load = torch.bincount(
+        topk_indices.flatten(),
+        minlength=self.n_routed_experts
+    ).to(dtype=torch.long)
+
+# In MOE.forward() - REDUNDANT computation!
+expert_token_counts = torch.bincount(
+    flat_topk_idx, minlength=self.n_routed_experts
+)
+```
+
+**Problem Analysis:**
+
+Systematic profiling using PyTorch Profiler revealed two categories of inefficiencies that persisted even after the major architectural optimizations: redundant computations and excessive data type conversions. The most significant redundancy was the duplicate `torch.bincount()` computation—Gate computed `expert_load` for bias updates, and MOE separately computed `expert_token_counts` for routing offsets, despite both being mathematically identical operations on the same input tensor. With 11 MoE layers and 5 profiling steps, this resulted in 110 bincount calls where only 55 were necessary. Each bincount triggers a GPU kernel launch and subsequent `.tolist()` synchronization, contributing approximately 360ms of CPU time (12.5% of total). The data copy analysis revealed additional inefficiencies: the `_compute_sequence_balance_loss` function performed a full tensor dtype conversion on the large `expert_mask` tensor (shape: batch × seq_len × top_k × n_experts) using `.to(scores.dtype)`, consuming unnecessary memory bandwidth. The inference path (`moe_infer`) repeatedly converted weights dtype inside the expert loop, and used `repeat()` instead of `expand()` for index expansion—`repeat()` allocates new memory and copies data, while `expand()` returns a view without copying. Profiling showed `aten::_to_copy` being called 260 times, consuming 357ms of CPU time, with much of this being redundant conversions that could be hoisted outside loops or eliminated entirely through careful dtype management.
+
+**Solution Approach:**
+
+The optimization strategy addresses both redundancy categories through systematic code refactoring. For the duplicate bincount, we modify Gate to return `expert_token_counts` as an additional output, allowing MOE to directly reuse this value instead of recomputing it. This requires changing the Gate forward signature from `return topk_indices, topk_weights, aux_seq_loss` to `return topk_indices, topk_weights, aux_seq_loss, expert_token_counts`, with corresponding updates in MOE.forward() to unpack and use the returned counts. For dtype conversions, we apply three targeted optimizations: (1) In Gate.forward(), add a dtype check before converting `expert_bias`—if already matching, skip the conversion entirely; (2) In `_compute_sequence_balance_loss`, defer dtype conversion until after the `sum()` reduction—converting the small `(bsz, n_experts)` result tensor is far cheaper than converting the large `(bsz, seq_len×top_k, n_experts)` mask; (3) In `moe_infer`, pre-convert weights dtype once before the expert loop, and replace `repeat()` with `expand()` for index expansion. These changes maintain functional equivalence while eliminating redundant operations. The optimization philosophy follows a key principle: **move invariant operations outside loops, and prefer views over copies**.
+
+**Optimized Code (`model/architecture/moe.py`):**
+
+```python
+# Gate.forward() - return expert_token_counts for reuse
+def forward(self, x):
+    # ... routing logic ...
+    
+    # [OPT] Compute expert_load ONCE, return for MOE to reuse
+    expert_token_counts = None
+    if self.training:
+        expert_token_counts = torch.bincount(
+            topk_indices.flatten(),
+            minlength=self.n_routed_experts
+        )
+        self.expert_load = expert_token_counts  # store for bias update
+    
+    return topk_indices, topk_weights, aux_seq_loss, expert_token_counts
+
+
+# MOE.forward() - reuse expert_token_counts from Gate
+def forward(self, x):
+    # [OPT] Gate now returns expert_token_counts to avoid duplicate bincount
+    topk_idx, topk_weight, aux_seq_loss, expert_token_counts = self.gate(x)
+    
+    if self.training:
+        # [OPT] Reuse expert_token_counts from Gate - eliminates duplicate bincount!
+        token_offsets = torch.empty(self.n_routed_experts + 1, device=x.device, dtype=torch.long)
+        token_offsets[0] = 0
+        token_offsets[1:] = torch.cumsum(expert_token_counts, dim=0)
+        # ... rest of routing logic ...
+
+
+# _compute_sequence_balance_loss - defer dtype conversion
+def _compute_sequence_balance_loss(self, scores, topk_idx, bsz, seq_len):
+    expert_mask = F.one_hot(
+        topk_idx_reshaped.view(bsz, -1),
+        num_classes=self.n_routed_experts
+    )  # Keep as int64 for now
+    
+    # [OPT] Sum first (reducing tensor size), THEN convert dtype
+    expert_counts = expert_mask.sum(dim=1)  # (bsz, n_experts), int64
+    f_i = expert_counts.to(scores.dtype) / (self.top_k * seq_len)  # Convert small tensor
+    # ... rest of loss computation ...
+
+
+# moe_infer - pre-convert weights, use expand instead of repeat
+def moe_infer(self, x, flat_expert_indices, flat_expert_weights):
+    # [OPT] Pre-convert weights dtype ONCE (avoid per-expert conversion)
+    if flat_expert_weights.dtype != x.dtype:
+        flat_expert_weights = flat_expert_weights.to(x.dtype)
+    
+    d_model = x.shape[-1]
+    
+    for i in range(self.n_routed_experts):
+        # ... expert processing ...
+        
+        # [OPT] Use expand (view, no copy) instead of repeat (allocates + copies)
+        scatter_idx = exp_token_idx.unsqueeze(1).expand(-1, d_model)
+        expert_cache.scatter_add_(0, scatter_idx, expert_out)
+```
+
+**Performance Impact:**
+
+The optimizations deliver measurable improvements across multiple profiling metrics. The `aten::bincount` call count decreases from 110 to 55 (50% reduction), validating the elimination of redundant computations. The `aten::item` call count decreases from 120 to 65 (45.8% reduction), indicating fewer synchronization points. The `aten::_to_copy` call count decreases from 260 to 205 (21.2% reduction), reflecting the dtype optimization benefits. The `cudaStreamSynchronize` count decreases from 285 to 230 (19.3% reduction), demonstrating reduced CPU-GPU synchronization overhead. In aggregate, these optimizations yield a modest but measurable throughput improvement: average step time decreases from 0.524s to 0.521s, and tokens per second increases from 62,530 to 62,843 (0.5% improvement). While the percentage gain appears small, it represents the extraction of remaining inefficiencies after the major architectural optimizations—the profiling-guided approach successfully identified and eliminated these "long tail" performance issues that would otherwise be invisible without systematic measurement. The optimizations also improve code quality by eliminating redundancy and making the data flow more explicit, facilitating future maintenance and extension.
+
+**Profiling Comparison Summary:**
+
+| Metric | Before Optimization | After Optimization | Improvement |
+|--------|--------------------|--------------------|-------------|
+| `aten::bincount` calls | 110 | 55 | **-50%** |
+| `aten::item` calls | 120 | 65 | **-45.8%** |
+| `cudaStreamSynchronize` calls | 285 | 230 | **-19.3%** |
+| `aten::_to_copy` calls | 260 | 205 | **-21.2%** |
+| Average step time | 0.524s | 0.521s | **-0.6%** |
+| Tokens per second | 62,530 | 62,843 | **+0.5%** |
+
+---
+
+#### Remaining Bottlenecks and Future Optimization Directions
+
+Despite the comprehensive optimizations applied, profiling reveals that certain architectural constraints impose fundamental performance limits that cannot be overcome through PyTorch-level optimizations alone. The primary remaining bottleneck is the **`.tolist()` synchronization** required to extract expert routing offsets for the Python-level expert loop. Even with duplicate bincount eliminated, each MoE layer still requires one `.tolist()` call to convert GPU tensor offsets to Python integers for loop indexing, resulting in 55 synchronizations across 11 layers that collectively consume 43.6% of CPU time (1.251s). This synchronization is inherent to the sequential expert processing paradigm where each expert's input slice depends on runtime routing decisions.
+
+**Future Optimization Directions:**
+
+| Optimization | Expected Impact | Implementation Complexity |
+|--------------|-----------------|---------------------------|
+| **Grouped GEMM** | Eliminate expert loop entirely, process all experts in single batched operation | High (requires custom CUDA kernels or specialized libraries like Megablocks) |
+| **Padding + Fixed Batching** | Convert dynamic expert assignments to fixed-size padded batches, enabling single GEMM per layer | Medium (may introduce computational waste from padding) |
+| **Expert Parallelism** | Distribute experts across multiple GPUs, reducing per-GPU expert count | Medium (requires distributed training infrastructure) |
+| **Triton Expert Kernels** | Implement full expert MLP as fused Triton kernel with dynamic input sizes | High (requires extensive kernel development) |
+
+The most promising direction is **Grouped GEMM**, which treats all expert MLPs as a single batched matrix multiplication with variable-sized groups. Libraries like [Megablocks](https://github.com/databricks/megablocks) and [vLLM](https://github.com/vllm-project/vllm) implement this approach using block-sparse matrix operations, achieving near-optimal GPU utilization by eliminating all Python-level loops and synchronization points. However, integrating such libraries requires significant architectural changes and careful handling of gradient computation for training. For production MoE training at scale, these advanced optimizations represent the necessary next step beyond the PyTorch-level optimizations documented in this section.
+
+---
+
 
 ## Experiment Results
 

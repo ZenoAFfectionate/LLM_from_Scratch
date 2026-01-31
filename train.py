@@ -11,8 +11,6 @@ import torch.nn as nn
 import wandb
 
 from torch.optim import AdamW
-# from model.optimizer.AdamW import AdamW
-
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.nn.utils import clip_grad_norm_
@@ -38,15 +36,13 @@ def load_data_memmap(data_path: str, dtype=np.int32):
     return data
 
 
-def prepare_data(config: Dict[str, Any], tokenizer: Tokenizer):
-    """Prepare training and validation data with automatic method selection"""
+def prepare_data(config: Dict[str, Any]):
+    """Prepare training and validation data using memory-mapped files"""
     data_dir = Path(config['data_dir'])
 
-    # paths for text and tokenized data
-    train_bin = data_dir / f"tokens_train.bin"  # tokenized train data
-    valid_bin = data_dir / f"tokens_valid.bin"  # tokenized valid data
+    train_bin = data_dir / "tokens_train.bin"
+    valid_bin = data_dir / "tokens_valid.bin"
 
-    # load tokenized data with memmap
     train_data = load_data_memmap(str(train_bin))
     valid_data = load_data_memmap(str(valid_bin))
 
@@ -124,28 +120,20 @@ def valid(model: nn.Module, val_loader: DataLoader, config: Dict[str, Any], devi
     amp_dtype = torch.bfloat16 if use_amp else torch.float32
 
     with torch.no_grad():
-        # create an iterator from the DataLoader
         val_loader_iter = iter(val_loader)
         for _ in range(num_batches):
             try:
                 inputs, targets = next(val_loader_iter)
-                # move to device with non_blocking for async transfer
-                inputs = inputs.to(device, non_blocking=True)
-                targets = targets.to(device, non_blocking=True)
             except StopIteration:
-                # if we run out of validation data, restart the iterator
                 val_loader_iter = iter(val_loader)
                 inputs, targets = next(val_loader_iter)
-                inputs = inputs.to(device, non_blocking=True)
-                targets = targets.to(device, non_blocking=True)
 
-            # use autocast for BF16 inference
+            inputs = inputs.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
+
             with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
                 logits = eval_model(inputs)
-                logits_flat = logits.view(-1, logits.size(-1))
-                targets_flat = targets.view(-1)
-                # compute cross entropy loss
-                loss = F.cross_entropy(logits_flat, targets_flat)
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
             total_loss += loss.item()
 
     avg_loss = total_loss / num_batches
@@ -203,40 +191,28 @@ def main():
     # Update config with actual vocab_size
     config.vocab_size = vocab_size
 
-    # Prepare data using config attributes
-    train_data, valid_data = prepare_data(config.to_dict(), tokenizer)
+    # Prepare data and cache config dict for later use
+    config_dict = config.to_dict()
+    train_data, valid_data = prepare_data(config_dict)
 
     num_workers = config.num_workers
+    use_workers = num_workers > 0
 
-    # create training dataset and loader
-    train_dataset = PretrainDataset(
-        data=train_data,
-        context_length=config.context_length
-    )
+    # Create training dataset and loader
+    train_dataset = PretrainDataset(data=train_data, context_length=config.context_length)
     train_loader = DataLoader(
-        train_dataset,
-        batch_size=config.batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True if num_workers > 0 else False,
-        persistent_workers=True if num_workers > 0 else False,
-        prefetch_factor=4 if num_workers > 0 else None,
+        train_dataset, batch_size=config.batch_size, shuffle=True,
+        num_workers=num_workers, pin_memory=use_workers,
+        persistent_workers=use_workers, prefetch_factor=4 if use_workers else None,
         drop_last=True,
     )
 
-    # create validate dataset and loader
-    valid_dataset = PretrainDataset(
-        data=valid_data,
-        context_length=config.context_length
-    )
+    # Create validation dataset and loader
+    valid_dataset = PretrainDataset(data=valid_data, context_length=config.context_length)
     valid_loader = DataLoader(
-        valid_dataset,
-        batch_size=config.batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True if num_workers > 0 else False,
-        persistent_workers=True if num_workers > 0 else False,
-        prefetch_factor=4 if num_workers > 0 else None,
+        valid_dataset, batch_size=config.batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=use_workers,
+        persistent_workers=use_workers, prefetch_factor=4 if use_workers else None,
         drop_last=False,
     )
 
@@ -244,32 +220,20 @@ def main():
     print(f"Validate dataset: {len(valid_dataset):,} samples")
     print(f"DataLoaders initialized successfully!\n")
 
-    model_dtype = torch.float32  # Always use FP32 for model weights
-
-    # Initialize model with Config object
-    model = TransformerLM(
-        config=config,
-        device=device,
-        dtype=model_dtype
-    ).to(device)
+    # Initialize model with FP32 weights (AMP handles BF16 forward pass)
+    model = TransformerLM(config=config, device=device, dtype=torch.float32).to(device)
     # count trainable parameters of the model
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Total parameters: {total_params:,}")
     print(f"Trainable parameters: {trainable_params:,}")
 
-    # compile the model with torch.compile for better performance
-    # Use optimal settings for Transformer training:
-    # - mode="reduce-overhead": Minimize kernel launch overhead (best for iterative workloads)
+    # Compile the model with torch.compile for better performance
+    # - mode="default": Balanced optimization between compilation time and performance
     # - fullgraph=False: Allow graph breaks for dynamic ops (bincount in MoE, etc.)
-    # - dynamic=False: Static shapes enable more aggressive optimizations
-    print("Compiling model with torch.compile (reduce-overhead mode)...")
-    model = torch.compile(
-        model,
-        mode="default",   # Minimize kernel launch overhead
-        fullgraph=False,  # Allow graph breaks for MoE dynamic ops (bincount)
-        dynamic=True     # Static shapes for better optimization
-    )
+    # - dynamic=True: Support dynamic tensor shapes
+    print("Compiling model with torch.compile...")
+    model = torch.compile(model, mode="default", fullgraph=False, dynamic=True)
     print("Model compiled successfully")
 
     # Initialize optimizer
@@ -368,15 +332,14 @@ def main():
         for accum_step in range(gradient_accumulation_steps):
             try:
                 loss, grad_norm = train(
-                    model, optimizer, train_loader_iter, config.to_dict(), device,
+                    model, optimizer, train_loader_iter, config_dict, device,
                     gradient_accumulation_steps=gradient_accumulation_steps,
                     accumulation_step=accum_step
                 )
             except StopIteration:
-                # If we exhaust the DataLoader, create a new iterator
                 train_loader_iter = iter(train_loader)
                 loss, grad_norm = train(
-                    model, optimizer, train_loader_iter, config.to_dict(), device,
+                    model, optimizer, train_loader_iter, config_dict, device,
                     gradient_accumulation_steps=gradient_accumulation_steps,
                     accumulation_step=accum_step
                 )
@@ -414,7 +377,7 @@ def main():
         # Validation and checkpointing
         if (iteration + 1) % config.eval_interval == 0:
             print("Running validation...")
-            val_loss, val_perplexity = valid(model, valid_loader, config.to_dict(), device)
+            val_loss, val_perplexity = valid(model, valid_loader, config_dict, device)
 
             val_content = f"Validation | Loss: {val_loss:.4f} | PPL: {val_perplexity:.2f}"
             print(val_content)

@@ -27,9 +27,10 @@ class MultiHeadSelfAttention(nn.Module):
         self.max_seq_len = max_seq_len
 
         # initialize the projection layers with explicit dtype
-        self.q_proj = nn.Linear(d_model, d_model, device=device, dtype=dtype)
-        self.k_proj = nn.Linear(d_model, d_model, device=device, dtype=dtype)
-        self.v_proj = nn.Linear(d_model, d_model, device=device, dtype=dtype)
+        self.qkv_proj = nn.Linear(d_model, 3 * d_model, device=device, dtype=dtype)
+        # self.q_proj = nn.Linear(d_model, d_model, device=device, dtype=dtype)
+        # self.k_proj = nn.Linear(d_model, d_model, device=device, dtype=dtype)
+        # self.v_proj = nn.Linear(d_model, d_model, device=device, dtype=dtype)
         self.output_proj = nn.Linear(d_model, d_model, device=device, dtype=dtype)
         # initalize the normalization layers (uses FP32 internally)
         self.q_norm = nn.RMSNorm(d_model, device=device)
@@ -65,9 +66,12 @@ class MultiHeadSelfAttention(nn.Module):
         token_positions = torch.arange(start_pos, start_pos + seq_len, device=x.device)
 
         # project input to q, k, v (batch, seq_len, d_model)
-        q = self.q_proj(x); q = self.q_norm(q)  # [OPT] add RMSNorm for q
-        k = self.k_proj(x); k = self.k_norm(k)  # [OPT] add RMSNorm for k
-        v = self.v_proj(x)
+        # q = self.q_proj(x); q = self.q_norm(q)  # [OPT] add RMSNorm for q
+        # k = self.k_proj(x); k = self.k_norm(k)  # [OPT] add RMSNorm for k
+        # v = self.v_proj(x)
+        q, k, v = self.qkv_proj(x).chunk(3, dim=-1)
+        q = self.q_norm(q)
+        k = self.k_norm(k)
 
         # reshape q, k, v for multi-head attention: (batch, seq_len, num_heads, head_dim)
         q = q.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)

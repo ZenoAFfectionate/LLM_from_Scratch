@@ -20,7 +20,6 @@ class Embedding(nn.Module):
     """
 
     def __init__(self, num_embeddings, embedding_dim, device=None, dtype=None):
-        '''  '''
         super().__init__()
         self.num_embeddings = num_embeddings  # the size of vocab
         self.embedding_dim = embedding_dim    # dim of emb vector
@@ -43,50 +42,25 @@ class Embedding(nn.Module):
 class RMSNorm(nn.Module):
     """
     PyTorch implementation of Root Mean Square Normalization with optional Fused Add & Norm.
-
-    Optimizations:
-    - @torch.compile for 20-30% speedup through kernel fusion and graph optimization
-    - In-place operations (.mul_(), .add_()) for reduced memory allocations
-    - Explicit FP32 computation for numerical stability in mixed precision training
     """
     def __init__(self, d_model: int, eps: float = 1e-5, device=None):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(d_model, dtype=torch.float32, device=device))
 
-    @torch.compile
-    def rms_forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Standard RMSNorm forward pass with explicit FP32 precision"""
-        orig_dtype = x.dtype
-        # compute variance in FP32 for numerical stability
-        x = x.float()
-        var = x.pow(2).mean(dim=-1, keepdim=True)
-        # in-place normalization
-        x.mul_(torch.rsqrt(var + self.eps))
-        # Convert back to original dtype and apply weight
-        x = x.to(orig_dtype).mul_(self.weight)
-        return x
-
-    @torch.compile
-    def add_rms_forward(self, x: torch.Tensor, residual: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Fused residual addition + RMSNorm for memory efficiency"""
-        orig_dtype = x.dtype
-        # Add residual in FP32 for precision
-        x = x.float().add_(residual.float())
-        residual = x.to(orig_dtype)
-        # Perform RMSNorm in FP32
-        var = x.pow(2).mean(dim=-1, keepdim=True)
-        x.mul_(torch.rsqrt(var + self.eps))
-        # Convert back and apply weight
-        x = x.to(orig_dtype).mul_(self.weight)
-        return x, residual
-
     def forward(self, x: torch.Tensor, residual: Optional[torch.Tensor] = None):
         """Forward pass with optional fused residual addition"""
+        dtype = x.dtype
         if residual is None:
-            return self.rms_forward(x)
+            x = x.float()
+            var = x.pow(2).mean(-1, keepdim=True)
+            x = x * torch.rsqrt(var + self.eps)
+            return (self.weight * x).to(dtype)
         else:
-            return self.add_rms_forward(x, residual)
+            x = residual = x.float() + residual.float()
+            var = x.pow(2).mean(-1, keepdim=True)
+            x = x * torch.rsqrt(var + self.eps)
+            return (self.weight * x).to(dtype), residual.to(dtype)
 
 
 # ---------------------------------------------------

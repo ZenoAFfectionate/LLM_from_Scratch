@@ -1,204 +1,102 @@
 import atexit
-from time import perf_counter
-from tqdm.auto import tqdm
+import torch.distributed as dist
+import time
 import torch.multiprocessing as mp
 
-from model.config import Config
-from model.tokenizer.bpe_tokenizer import Tokenizer
-from engine.sampling_params import SamplingParams
-from engine.sequence import Sequence
-from engine.scheduler import Scheduler
-from engine.model_runner import ModelRunner
+from sequence import Sequence
+from scheduler import Scheduler
+from model_runner import ModelRunner
+from myvllm.sampling_parameters import SamplingParams
+from transformers import AutoTokenizer
+
+
+def worker_process(config, rank, event):
+    """Worker process function that initializes ModelRunner and enters loop."""
+    import os
+    import sys
+    sys.stdout = os.fdopen(sys.stdout.fileno(), 'w', buffering=1)  # Line buffering
+    sys.stderr = os.fdopen(sys.stderr.fileno(), 'w', buffering=1)  # Line buffering
+    # create ModelRunner instance and enter loop
+    model_runner = ModelRunner(config, rank, event)
+    model_runner.loop()
 
 
 class LLMEngine:
     """
-    LLM inference engine that coordinates model execution, scheduling, and tokenization.
-
-    This engine supports:
-    - Single and multi-GPU inference with tensor parallelism
-    - Continuous batching for efficient throughput
-    - Custom BPE tokenizer or HuggingFace tokenizers
+    LLM Engine that manages multiple processes for model inference.
     """
-
-    def __init__(self, config: Config | str, tokenizer: Tokenizer = None, **kwargs):
-        """
-        Initialize the LLM engine.
-
-        Args:
-            config: Either a Config object or path to a JSON config file
-            tokenizer: Optional Tokenizer instance. If not provided, will attempt to
-                      create from config (vocab_file, merges_file) or use a dummy tokenizer.
-            **kwargs: Additional config overrides
-        """
-        # Load config from file if string path is provided
-        if isinstance(config, str):
-            config = Config.from_json(config)
-
-        # Apply any config overrides
-        for key, value in kwargs.items():
-            if hasattr(config, key):
-                setattr(config, key, value)
-
-        self.config = config
-
-        # Setup multiprocessing for tensor parallelism
-        self.ps = []
-        self.events = []
+    def __init__(self, config: dict):
+        # initialize scheduler
+        self.scheduler = Scheduler(
+            max_num_sequences=config.get("max_num_sequences", 16),
+            max_num_batched_tokens=config.get("max_num_batched_tokens", 1024),
+            max_cached_blocks=config.get("max_cached_blocks", 1024),
+            block_size=config.get("block_size", 256),
+            eos=config.get("eos", 50256)
+        )
+        # initialize worker processes (rank 0)
+        world_size = config.get("world_size", 1)
         ctx = mp.get_context("spawn")
-        tensor_parallel_size = getattr(config, 'tensor_parallel_size', 1)
-
-        for i in range(1, tensor_parallel_size):
+        self.processes = []
+        self.events = []
+        # traverse ranks and initialize each process
+        for i in range(1, world_size):
             event = ctx.Event()
-            process = ctx.Process(target=ModelRunner, args=(config, i, event))
-            process.start()
-            self.ps.append(process)
+            process = ctx.Process(target=worker_process, args=(config, i, event))
             self.events.append(event)
-
-        # Initialize model runner on rank 0
-        self.model_runner = ModelRunner(config, 0, self.events)
-
-        # Initialize tokenizer
-        if tokenizer is not None:
-            self.tokenizer = tokenizer
-        elif hasattr(config, 'vocab_file') and config.vocab_file:
-            # Use the custom BPE tokenizer
-            self.tokenizer = Tokenizer.from_files(
-                vocab_filepath=config.vocab_file,
-                merges_filepath=config.merges_file,
-                special_tokens=getattr(config, 'special_tokens', ["<|endoftext|>"])
-            )
-        else:
-            # Try to use HuggingFace tokenizer if model path is provided
-            model_path = getattr(config, 'checkpoint_path', None) or getattr(config, 'model', None)
-            if model_path:
-                try:
-                    from transformers import AutoTokenizer
-                    self.tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
-                except Exception:
-                    self.tokenizer = None
-            else:
-                self.tokenizer = None
-
-        # Set EOS token ID
-        if self.tokenizer is not None:
-            if hasattr(self.tokenizer, 'eos_token_id'):
-                config.eos = self.tokenizer.eos_token_id
-            elif hasattr(self.tokenizer, 'decoder_vocab'):
-                # For custom BPE tokenizer, look for <|endoftext|>
-                eos_token = "<|endoftext|>"
-                config.eos = self.tokenizer.encoder_vocab.get(eos_token, -1)
-            else:
-                config.eos = -1
-        else:
-            config.eos = getattr(config, 'eos', -1)
-
-        # Initialize scheduler
-        self.scheduler = Scheduler(config)
+            self.processes.append(process)
+            process.start()
+        # start the engine only on the master thread with rank = 0
+        self.model_runner = ModelRunner(config, rank=0, event=self.events)
+        self.tokenizer = AutoTokenizer.from_pretrained(config.get("model_name_or_path", "gpt2"))
         atexit.register(self.exit)
 
+
     def exit(self):
-        """Clean up resources and terminate worker processes."""
         self.model_runner.call("exit")
         del self.model_runner
-        for p in self.ps:
-            p.join()
+        for process in self.processes:
+            process.join()
 
-    def add_request(self, prompt: str | list[int], sampling_params: SamplingParams = None):
-        """
-        Add a generation request to the queue.
 
-        Args:
-            prompt: Input text string or list of token IDs
-            sampling_params: Sampling parameters (uses defaults if not provided)
-        """
-        if sampling_params is None:
-            sampling_params = SamplingParams()
+    def step(self) -> tuple[list[int], bool]:
+        '''A single step of scheduling, model execution, and postprocessing'''
+        # schedule sequences
+        scheduled_sequences, is_prefill = self.scheduler.schedule()
+        if not scheduled_sequences: return [], is_prefill
+        # run the model
+        outputs = self.model_runner.call("run", scheduled_sequences, is_prefill)
+        # postprocess the outputs
+        self.scheduler.postprocess(scheduled_sequences, outputs)
 
-        if isinstance(prompt, str):
-            if self.tokenizer is None:
-                raise ValueError("Tokenizer not available. Please provide token IDs directly.")
-            prompt = self.tokenizer.encode(prompt)
+        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in scheduled_sequences if seq.is_finished]
+        num_processed_tokens = sum(len(seq) for seq in scheduled_sequences) if is_prefill else len(scheduled_sequences)
+        return outputs, num_processed_tokens, is_prefill
 
-        seq = Sequence(prompt, sampling_params)
-        self.scheduler.add(seq)
 
-    def step(self):
-        """Execute one inference step."""
-        seqs, is_prefill = self.scheduler.schedule()
-        token_ids = self.model_runner.call("run", seqs, is_prefill)
-        self.scheduler.postprocess(seqs, token_ids)
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
-        num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
-        return outputs, num_tokens
+    def add_prompt(self, prompt: str, sampling_params: SamplingParams) -> None:
+        '''Add a prompt string to the waiting queue by first transforming it to a Sequence object.'''
+        self.scheduler.add_sequence(Sequence(token_ids=self.tokenizer.encode(prompt), sampling_params=sampling_params))
 
-    def is_finished(self):
-        """Check if all requests have been processed."""
-        return self.scheduler.is_finished()
 
-    def generate(
-        self,
-        prompts: list[str] | list[list[int]],
-        sampling_params: SamplingParams | list[SamplingParams] = None,
-        use_tqdm: bool = True,
-    ) -> list[dict]:
-        """
-        Generate completions for a batch of prompts.
-
-        Args:
-            prompts: List of input strings or token ID lists
-            sampling_params: Sampling parameters (single or per-prompt list)
-            use_tqdm: Whether to show progress bar
-
-        Returns:
-            List of dicts with 'text' and 'token_ids' for each prompt
-        """
-        if use_tqdm:
-            pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True)
-
-        if sampling_params is None:
-            sampling_params = SamplingParams()
-
-        if not isinstance(sampling_params, list):
-            sampling_params = [sampling_params] * len(prompts)
-
-        for prompt, sp in zip(prompts, sampling_params):
-            self.add_request(prompt, sp)
-
-        outputs = {}
-        prefill_throughput = decode_throughput = 0.
-
-        while not self.is_finished():
-            t = perf_counter()
-            output, num_tokens = self.step()
-
-            if use_tqdm:
-                if num_tokens > 0:
-                    prefill_throughput = num_tokens / (perf_counter() - t)
-                else:
-                    decode_throughput = -num_tokens / (perf_counter() - t)
-                pbar.set_postfix({
-                    "Prefill": f"{int(prefill_throughput)}tok/s",
-                    "Decode": f"{int(decode_throughput)}tok/s",
-                })
-
-            for seq_id, token_ids in output:
-                outputs[seq_id] = token_ids
-                if use_tqdm:
-                    pbar.update(1)
-
-        outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
-
-        # Decode if tokenizer is available
-        if self.tokenizer is not None:
-            outputs = [
-                {"text": self.tokenizer.decode(token_ids), "token_ids": token_ids}
-                for token_ids in outputs
-            ]
-        else:
-            outputs = [{"text": None, "token_ids": token_ids} for token_ids in outputs]
-
-        if use_tqdm:
-            pbar.close()
-
-        return outputs
+    def generate(self, prompts: list[str], sampling_params: SamplingParams) -> list[str]:
+        '''Perform generation for a list of requests (serve as prompts)'''
+        # add prompts to the waiting queue
+        for prompt in prompts:
+            self.add_prompt(prompt, sampling_params)
+        generated_tokens = {}
+        # call step until all sequences are finished
+        while not self.scheduler.is_finished():
+            start_t = time.time()
+            outputs, num_processed_tokens, is_prefill = self.step()
+            end_t = time.time()
+            running_time = end_t - start_t + 1e-10
+            if is_prefill:
+                print(num_processed_tokens, 'number of processed tokens', num_processed_tokens/running_time, "tokens/sec during prefilling")
+            else:
+                print(num_processed_tokens, 'number of processed tokens', num_processed_tokens/running_time, "tokens/sec during decoding")
+            generated_tokens.update({seq_id: tokens for seq_id, tokens in outputs})
+        # sort generated tokens by seq_id to maintain order
+        generated_tokens = [generated_tokens[seq_id] for seq_id in sorted(generated_tokens.keys())]
+        output = {'text': [self.tokenizer.decode(tokens) for tokens in generated_tokens], 'token_ids': generated_tokens}
+        return output

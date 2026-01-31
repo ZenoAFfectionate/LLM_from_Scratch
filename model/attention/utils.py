@@ -15,19 +15,8 @@ def softmax(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
 # -------------------------------------------------------
 #  Problem 6: Implement Rotary Position Embedding Module
 # -------------------------------------------------------
-def _apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    """Helper function to apply rotary embeddings with optimized chunking"""
-    # split x into two halves in FP32 for stability
-    x1, x2 = torch.chunk(x.float(), 2, dim=-1)
-    y1 = x1 * cos - x2 * sin  # rotate 1st half
-    y2 = x2 * cos + x1 * sin  # rotate 2nd half
-    # concatenate and cast back to original dtype
-    return torch.cat((y1, y2), dim=-1).to(x.dtype)
-
-
 class RotaryPositionalEmbedding(nn.Module):
     """PyTorch implementation of Rotary Position Embedding module"""
-    
     def __init__(self, theta: float, d_k: int, max_seq_len: int, device=None):
         super().__init__()
         self.d_k = d_k
@@ -49,7 +38,11 @@ class RotaryPositionalEmbedding(nn.Module):
         cos_sin = self.cos_sin_cached[token_positions, :d_x]  # (seq_len, d_x)
         cos_sin = cos_sin.view(*([1] * (x.ndim - 2)), *cos_sin.shape)
         cos, sin = torch.chunk(cos_sin, 2, dim=-1)  # split back to sin and cos
-        return _apply_rotary(x, cos, sin)
+        # peform rotary positional embedding for x
+        x1, x2 = torch.chunk(x.float(), 2, dim=-1)
+        y1 = x1 * cos - x2 * sin  # rotate 1st half
+        y2 = x2 * cos + x1 * sin  # rotate 2nd half
+        return torch.cat((y1, y2), dim=-1).to(x.dtype)
 
 
 # ---------------------------------------------------

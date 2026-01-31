@@ -6,7 +6,6 @@ from model.config import Config
 from model.attention.utils import RotaryPositionalEmbedding
 from model.architecture.mlp import MLP
 from model.architecture.moe import MOE
-from model.architecture.enGram import Engram
 from model.attention.MHA import MultiHeadSelfAttention
 from model.attention.GQA import GroupedQueryAttention
 from model.attention.MLA import MultiHeadLatentAttention

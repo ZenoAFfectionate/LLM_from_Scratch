@@ -83,10 +83,10 @@ class GroupedQueryAttention(nn.Module):
         v = self.v_proj(x)
 
         # (bsz, seq_len, num_q_heads, head_dim)  -> (bsz, num_q_heads, seq_len, head_dim)
-        q = q.view(bsz, seq_len, self.num_query_heads, self.head_dim).transpose(-2, -3)
+        q = q.view(bsz, seq_len, self.num_query_heads, self.head_dim).transpose(1, 2)
         # (bsz, seq_len, num_kv_heads, head_dim) -> (bsz, num_kv_heads, seq_len, head_dim)
-        k = k.view(bsz, seq_len, self.num_kv_heads, self.head_dim).transpose(-2, -3)
-        v = v.view(bsz, seq_len, self.num_kv_heads, self.head_dim).transpose(-2, -3)
+        k = k.view(bsz, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = v.view(bsz, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
         # apply RoPE to q and k using token_positions
         if self.rope is not None:

@@ -1,44 +1,43 @@
-from copy import copy
 from enum import Enum, auto
-from itertools import count
-
-from ..utils.sampler import SamplingParams
+import math
+from itertools import count 
+from sampling_parameters import SamplingParams
+from copy import copy
 
 
 class SequenceStatus(Enum):
-    ''' Mark the status of text generation sequence '''
-    WAITING = auto()   # waiting generation
-    RUNNING = auto()   # running generation
-    FINISHED = auto()  # finished generation
+    WAITING = auto()   # 
+    RUNNING = auto()   # 
+    FINISHED = auto()  # 
 
 
 class Sequence:
-    """ Manage the state of a single text generation sequence """
-
-    block_size = 256   # the block size for cache
+    block_size = 256   # number of tokens per block
     counter = count()  # unique sequence ID generator
 
     def __init__(self, token_ids: list[int], sampling_params = SamplingParams()):
         self.seq_id = next(Sequence.counter)
         self.status = SequenceStatus.WAITING
         self.token_ids = copy(token_ids)
-        self.last_token = token_ids[-1]
-        # token count statistics
+        # record newly generated token for efficient looking up
+        self.last_token = self.token_ids[-1] if self.token_ids else None
+        # initialize token counts
         self.num_tokens = len(self.token_ids)
-        self.num_prompt_tokens = len(token_ids)
+        self.num_prompt_tokens = len(self.token_ids)
         self.num_cached_tokens = 0
-        # record block ID occupied by this sequence
+        # initialize block table
         self.block_table = []
-        # sampling parameters for SamplingParams
+        # sampling_params' related things
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
+        self.max_model_length = sampling_params.max_model_length
 
     def __len__(self):
         return self.num_tokens
 
-    def __getitem__(self, key):
-        return self.token_ids[key]
+    def __getitem__(self, idx):
+        return self.token_ids[idx]
 
     @property
     def is_finished(self):
@@ -58,32 +57,58 @@ class Sequence:
 
     @property
     def num_cached_blocks(self):
-        return self.num_cached_tokens // self.block_size
+        return int(math.ceil(self.num_cached_tokens / self.block_size))
 
     @property
     def num_blocks(self):
-        return (self.num_tokens + self.block_size - 1) // self.block_size
+        return int(math.ceil(self.num_tokens / self.block_size))
 
     @property
     def last_block_num_tokens(self):
-        return self.num_tokens - (self.num_blocks - 1) * self.block_size
+        full_blocks = int(math.floor(self.num_tokens / self.block_size))
+        return len(self.token_ids[full_blocks * self.block_size : ])
 
     def block(self, i):
-        assert 0 <= i < self.num_blocks
-        return self.token_ids[i*self.block_size: (i+1)*self.block_size]
+        '''Get the token IDs in i-th block'''
+        assert 0 <= i < self.num_blocks, f"Block index {i} out of range [0, {self.num_blocks})"
+        # when it is the last block
+        if i == self.num_blocks - 1:
+            return self.token_ids[-self.last_block_num_tokens:]
+        # when it is not the last block
+        else:
+            start_idx = i * self.block_size
+            end_idx = start_idx + self.block_size
+            return self.token_ids[start_idx : end_idx]
 
-    def append_token(self, token_id: int):
+    def append_token(self, token_id):
         self.token_ids.append(token_id)
         self.last_token = token_id
-        self.num_tokens += 1
+        self.num_tokens += 1 
 
     def __getstate__(self):
-        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
-                self.token_ids if self.num_completion_tokens == 0 else self.last_token)
+        return (
+            self.num_tokens, 
+            self.num_prompt_tokens, 
+            self.num_cached_tokens, 
+            self.block_table,
+            self.token_ids if self.num_completion_tokens == 0 else self.last_token
+        )
 
     def __setstate__(self, state):
-        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table = state[:-1]
-        if self.num_completion_tokens == 0:
-            self.token_ids = state[-1]
+        (
+            self.num_tokens,
+            self.num_prompt_tokens,
+            self.num_cached_tokens,
+            self.block_table,
+            last_token_or_ids
+        ) = state
+        num_completion_tokens = self.num_tokens - self.num_prompt_tokens
+        # check if this is prefill or decode phase
+        if num_completion_tokens == 0:
+            # Prefill: last_token_or_ids is the full token_ids list
+            self.token_ids = last_token_or_ids
         else:
-            self.last_token = state[-1]
+            # Decode: last_token_or_ids is just the last token
+            self.token_ids = [last_token_or_ids]
+        # restore last_token attribute
+        self.last_token = self.token_ids[-1] if self.token_ids else None

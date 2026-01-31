@@ -1,7 +1,9 @@
 import math
 import torch
+import triton
 
 import torch.nn as nn
+import triton.language as tl
 import torch.nn.functional as F
 
 from model.architecture.mlp import MLP
@@ -89,18 +91,18 @@ class Gate(nn.Module):
         biased_logits = logits + self.expert_bias.to(logits.dtype).unsqueeze(0)
 
         # select top-k experts based on biased logits and their unbiased weights
-        _, topk_idx = torch.topk(biased_logits, k=self.top_k, dim=-1, sorted=False)
-        topk_weight = torch.gather(scores, dim=-1, index=topk_idx)
+        _, topk_indices = torch.topk(biased_logits, k=self.top_k, dim=-1, sorted=False)
+        topk_weights = torch.gather(scores, dim=-1, index=topk_indices)
         # re-normalize the weights of the selected experts
         if self.top_k > 1:
-            denominator = topk_weight.sum(dim=-1, keepdim=True) + 1e-10
-            topk_weight = topk_weight / denominator
+            denominator = topk_weights.sum(dim=-1, keepdim=True) + 1e-10
+            topk_weights = topk_weights / denominator
 
         # [OPT] track expert load of current batch (for bias update)
         # use vectorized bincount instead of Python loop to avoid sync
         if self.training:
             self.expert_load = torch.bincount(
-                topk_idx.flatten(),
+                topk_indices.flatten(),
                 minlength=self.n_routed_experts
             ).to(dtype=torch.long)
 
@@ -108,10 +110,10 @@ class Gate(nn.Module):
         aux_seq_loss = None
         if self.seq_alpha > 0 and self.training:
             aux_seq_loss = self._compute_sequence_balance_loss(
-                scores, topk_idx, bsz, seq_len
+                scores, topk_indices, bsz, seq_len
             )
 
-        return topk_idx, topk_weight, aux_seq_loss
+        return topk_indices, topk_weights, aux_seq_loss
 
     def _compute_sequence_balance_loss(self, scores, topk_idx, bsz, seq_len):
         """
@@ -158,7 +160,6 @@ class Gate(nn.Module):
             total_tokens: Total number of tokens processed in the batch
         """
         if not self.training: return
-
         # calculate expected load per expert (uniform distribution)
         expected_load = (total_tokens * self.top_k) / self.n_routed_experts
         # vectorized bias update: compute difference and update all biases at once
@@ -248,7 +249,7 @@ class MOE(nn.Module):
             # count how many tokens each expert processes (n_routed_experts,)
             expert_token_counts = torch.bincount(
                 flat_topk_idx, minlength=self.n_routed_experts
-)
+            )
 
             # compute cumulative offsets: [0, count[0], count[0]+count[1], ...]
             token_offsets = torch.cat([
@@ -280,7 +281,7 @@ class MOE(nn.Module):
             # expand sorted_token_idx for scatter operation
             sorted_token_idx_expanded = sorted_token_idx.unsqueeze(-1).expand_as(y_sorted)
             # scatter-add to accumulate contributions from multiple experts to same token
-            y_flat.scatter_add_(0, sorted_token_idx_expanded, y_sorted)
+            y_flat.scatter_add(0, sorted_token_idx_expanded, y_sorted)
 
             y = y_flat.view(batch_size, seq_len, -1)
         else:

@@ -10,7 +10,6 @@ from model.tokenizer.bpe_tokenizer import Tokenizer
 from model.transformer import TransformerLM
 
 
-
 @torch.inference_mode()
 def generate(
     model: TransformerLM,

@@ -359,7 +359,7 @@ def main():
         for accum_step in range(gradient_accumulation_steps):
             try:
                 loss, grad_norm = train(
-                    model, optimizer, train_loader_iter, config, device,
+                    model, optimizer, train_loader_iter, config.to_dict(), device,
                     gradient_accumulation_steps=gradient_accumulation_steps,
                     accumulation_step=accum_step
                 )
@@ -367,7 +367,7 @@ def main():
                 # If we exhaust the DataLoader, create a new iterator
                 train_loader_iter = iter(train_loader)
                 loss, grad_norm = train(
-                    model, optimizer, train_loader_iter, config, device,
+                    model, optimizer, train_loader_iter, config.to_dict(), device,
                     gradient_accumulation_steps=gradient_accumulation_steps,
                     accumulation_step=accum_step
                 )

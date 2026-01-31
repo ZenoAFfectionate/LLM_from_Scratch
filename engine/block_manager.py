@@ -1,8 +1,8 @@
-from collections import deque
 import xxhash
 import numpy as np
+from collections import deque
 
-from engine.sequence import Sequence
+from sequence import Sequence
 
 
 class Block:
@@ -10,20 +10,19 @@ class Block:
     Basic unit of memory in vLLM: stores a fixed-size chunk of tokens
     Manages reference count (4 block reuse) and hash (4 cache lookup)
     """
-
     def __init__(self, block_id):
         self.block_id = block_id
+        self.hash = -1 
         self.ref_count = 0
-        self.hash = -1
         self.token_ids = []
 
-    def update(self, hash: int, token_ids: list[int]):
-        self.hash = hash
+    def update(self, h: int, token_ids: list[int]):
+        self.hash = h 
         self.token_ids = token_ids
 
     def reset(self):
-        self.ref_count = 1
-        self.hash = -1
+        self.hash = -1 
+        self.ref_count = 0
         self.token_ids = []
 
 
@@ -34,113 +33,125 @@ class BlockManager:
     - Reuses blocks via hash-based caching (reduces memory duplication)
     - Manages free/used block pools with reference counting
     """
-
     def __init__(self, num_blocks: int, block_size: int):
-        self.block_size = block_size
+        self.block_size: int = block_size  # num of token per block
         # initalize all blocks sequentially from 0 to num_blocks-1
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
         # hash map: block hash -> block ID (for fast cache lookup)
-        self.hash_to_block_id: dict[int, int] = dict()
-        # record free_block ids and used_block ids
+        self.hash_to_block_id: dict[int, int] = {}
         self.free_block_ids: deque[int] = deque(range(num_blocks))
         self.used_block_ids: set[int] = set()
 
-    @classmethod
-    def compute_hash(cls, token_ids: list[int], prefix: int = -1):
+    def compute_hash(self, token_ids: list[int], prefix_hash_value: int) -> int:
         """
-        Compute a unique hash for a block of tokens (with optional prefix for continuity)
-        - prefix: hash of the previous block (ensures unique hash for sequential blocks)
+        Compute a unique hash for a block of tokens (optional prefix for continuity)
+        - prefix: hash of the previous block (unique hash for sequence continuity)
         - Uses xxh64 (fast, non-cryptographic hash) for performance
         """
         h = xxhash.xxh64()
         # add prefix to bytes stream (little-endian, 8 bytes)
-        if prefix != -1: h.update(prefix.to_bytes(8, "little"))
+        if prefix_hash_value != -1:
+            h.update(prefix_hash_value.to_bytes(8, 'little'))
         # convert token list to numpy array then to bytes
-        h.update(np.array(token_ids).tobytes())
+        h.update(np.array(token_ids, dtype=np.int32).tobytes())
         return h.intdigest()
 
-    def _allocate_block(self, block_id: int) -> Block:
-        block = self.blocks[block_id]
-        # block must be free before allocation:
-        assert block.ref_count == 0
-        block.reset()
-        self.free_block_ids.remove(block_id)  # removing from free queue
-        self.used_block_ids.add(block_id)     # adding to used set
-        return self.blocks[block_id]
 
-    def _deallocate_block(self, block_id: int) -> Block:
-        assert self.blocks[block_id].ref_count == 0
-        self.used_block_ids.remove(block_id)  # removing from used set
-        self.free_block_ids.append(block_id)  # adding to free queue
+    def _allocate_block(self, block_id: int) -> Block:
+        """Allocate a block and add it to the used list"""
+        block = self.blocks[block_id]
+        # check if the block is already allocated
+        assert block.ref_count == 0, "Block is already allocated"
+        block.reset()  # reset block state
+        # remove from free list and add to used list
+        self.free_block_ids.remove(block_id)
+        self.used_block_ids.add(block_id)
+        return block
+
+    def _deallocate_block(self, block_id: int) -> None:
+        """Deallocate a block and add it to the free list"""
+        assert self.blocks[block_id].ref_count == 0, "Block is still in use"
+        block = self.blocks[block_id]
+        block.token_ids = []  # reset token IDs
+        # remove from used list and add to free list
+        self.used_block_ids.remove(block_id)
+        self.free_block_ids.append(block_id)
+
 
     def can_allocate(self, seq: Sequence) -> bool:
-        '''  Check if enough free blocks are available for allocation '''
+        '''Check if we can allocate a block for this sequence'''
         return len(self.free_block_ids) >= seq.num_blocks
 
-    def allocate(self, seq: Sequence):
-        assert not seq.block_table, "Sequence already has allocated blocks"
+    def allocate(self, seq: Sequence) -> None:
+        """Allocate blocks for this sequence"""
         h = -1
-        cache_miss = False
-        # iterate over each block needed by the sequence
         for i in range(seq.num_blocks):
-            token_ids = seq.block(i)  # get token id for i-th block
-            # compute hash only if block is full (match block size)
-            h = self.compute_hash(token_ids, h) if len(token_ids) == self.block_size else -1
-            # check cache: get block id from hash map
+            no_cache_found = False
+            token_ids = seq.block(i)
+            # only compute hash for full blocks, always -1 for partial blocks
+            h = self.compute_hash(token_ids=token_ids, prefix_hash_value=h) if len(token_ids) == self.block_size else -1
             block_id = self.hash_to_block_id.get(h, -1)
+            
+            # if cache miss or hash collision
             if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
-                cache_miss = True
-            # Handle cache miss: allocate new block from free pool
-            if cache_miss:
-                block_id = self.free_block_ids[0]
-                block = self._allocate_block(block_id)
-            # Handle cache hit: reuse existing block
-            else:
-                seq.num_cached_tokens += self.block_size
-                # already in used blocks: increment count
-                if block_id in self.used_block_ids:
-                    self.blocks[block_id].ref_count += 1
-                # not in used blocks: allocate and use it
-                else:
-                    block = self._allocate_block(block_id)
-            # update block hash/tokens and cache map
-            if h != -1:
-                block.update(h, token_ids)
-                self.hash_to_block_id[h] = block_id
-            seq.block_table.append(block_id)
+                no_cache_found = True
 
-    def deallocate(self, seq: Sequence):
-        # deallocate in reverse order to consistent with allocation order
-        for block_id in reversed(seq.block_table):
+            if not no_cache_found:
+                seq.num_cached_tokens += self.block_size
+                # allocate a new block if not used yet
+                if block_id not in self.used_block_ids:
+                    block = self._allocate_block(block_id)
+                # update block information if already used
+                else:
+                    block = self.blocks[self.hash_to_block_id[h]]
+                    block.ref_count += 1
+            else:
+                # allocate a new block and update its information
+                block = self._allocate_block(self.free_block_ids[0])
+                block.update(h=h, token_ids=token_ids)
+                if h != -1: self.hash_to_block_id[h] = block.block_id
+            
+            seq.block_table.append(block.block_id)  # update block table
+    
+    def deallocate(self, seq: Sequence) -> None:
+        """Deallocate blocks for this sequence"""
+        # update block information
+        for block_id in seq.block_table:
             block = self.blocks[block_id]
             block.ref_count -= 1
+            # deallocate if no longer used
             if block.ref_count == 0:
                 self._deallocate_block(block_id)
-        # reset sequence's block state
+        # update sequence information
+        seq.block_table = []
         seq.num_cached_tokens = 0
-        seq.block_table.clear()
+
 
     def can_append(self, seq: Sequence) -> bool:
-        return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
+        """Check if we can append tokens to this sequence"""
+        if seq.num_tokens % self.block_size == 0:
+            return len(self.free_block_ids) > 0
+        return True
 
-    def may_append(self, seq: Sequence):
-        block_table = seq.block_table
-        last_block = self.blocks[block_table[-1]]
-        # case 1: next token needs a new block
-        if len(seq) % self.block_size == 1:
-            assert last_block.hash != -1, ""
-            block_id = self.free_block_ids[0]
-            self._allocate_block(block_id)
-            block_table.append(block_id)
-        # case 2: last block is now full
-        elif len(seq) % self.block_size == 0:
-            assert last_block.hash == -1, ""
-            token_ids = seq.block(seq.num_blocks-1)
-            prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
-            # compute hash and update block/cache
-            h = self.compute_hash(token_ids, prefix)
-            last_block.update(h, token_ids)
-            self.hash_to_block_id[h] = last_block.block_id
-        # case 3: last block is partially filled
+    def append(self, seq: Sequence) -> None:
+        '''Append tokens to this sequence'''
+        block_tables = seq.block_table
+        last_block_for_seq_id = block_tables[-1]
+
+        # if the last block is now full, compute hash
+        if seq.num_tokens % self.block_size == 0:
+            prefix = -1 if len(block_tables) == 1 else self.blocks[block_tables[-2]].hash
+            h = self.compute_hash(token_ids = seq.block(seq.num_blocks - 1), prefix_hash_value=prefix)
+            block = self.blocks[last_block_for_seq_id]
+            block.update(h=h, token_ids=seq.block(seq.num_blocks - 1))
+            self.hash_to_block_id[h] = block.block_id
+        # if one new block is needed
+        elif seq.num_tokens % self.block_size == 1:
+            # Previous block should be finalized
+            assert self.blocks[last_block_for_seq_id].hash != -1
+            block = self._allocate_block(self.free_block_ids[0])
+            block_tables.append(block.block_id)
+        # else, do nothing
         else:
-            assert last_block.hash == -1
+            assert last_block_for_seq_id in self.used_block_ids,  "Last block should be allocated"
+            assert self.blocks[last_block_for_seq_id].hash == -1, "Last block should be partial block with hash -1"

@@ -23,9 +23,11 @@ class Embedding(nn.Module):
         super().__init__()
         self.num_embeddings = num_embeddings  # the size of vocab
         self.embedding_dim = embedding_dim    # dim of emb vector
-        if dtype is None: dtype = torch.float32 # default to FP32
+        if dtype is None:
+            dtype = torch.float32  # default to FP32
         # create an uninitialized tensor on requested device and dtype
-        weight = torch.empty((num_embeddings, embedding_dim), device=device, dtype=dtype)
+        weight = torch.empty((num_embeddings, embedding_dim),
+                             device=device, dtype=dtype)
         # initialize the weight matrix and warp in Parameter
         nn.init.trunc_normal_(weight, mean=0.0, std=1.0, a=-3, b=+3)
         self.weight = nn.Parameter(weight)
@@ -43,6 +45,7 @@ class RMSNorm(nn.Module):
     """
     PyTorch implementation of Root Mean Square Normalization with optional Fused Add & Norm.
     """
+
     def __init__(self, d_model: int, eps: float = 1e-5, device=None):
         super().__init__()
         self.eps = eps
@@ -115,16 +118,19 @@ def cos_learning_rate_schedule_with_warmup(t: int, max_lr: float, min_lr: float,
 def data_loading(x: np.ndarray, batch_size: int, context_length: int, device=None):
     """ Generates a random batch of training data from a 1D sequence of token IDs """
     # choose random start indices for each sequence in the batch
-    start_indices = np.random.randint(0, len(x) - context_length, size=batch_size)
+    start_indices = np.random.randint(
+        0, len(x) - context_length, size=batch_size)
 
     # create input and target sequences based on start indices
-    input_sequences  = [x[i : i + context_length] for i in start_indices]
-    target_sequences = [x[i + 1 : i + 1 + context_length] for i in start_indices]
+    input_sequences = [x[i: i + context_length] for i in start_indices]
+    target_sequences = [x[i + 1: i + 1 + context_length]
+                        for i in start_indices]
 
-    inputs_np, targets_np = np.array(input_sequences), np.array(target_sequences)
+    inputs_np, targets_np = np.array(
+        input_sequences), np.array(target_sequences)
 
     # convert to PyTorch tensors and move to the specified device
-    inputs  = torch.from_numpy(inputs_np).to(torch.long).to(device)
+    inputs = torch.from_numpy(inputs_np).to(torch.long).to(device)
     targets = torch.from_numpy(targets_np).to(torch.long).to(device)
 
     return inputs, targets
@@ -140,10 +146,10 @@ class ShortConv(nn.Module):
     """
 
     def __init__(
-        self, 
-        hidden_size: int, 
-        kernel_size: int = 4, 
-        dilation: int = 1, 
+        self,
+        hidden_size: int,
+        kernel_size: int = 4,
+        dilation: int = 1,
         norm_eps: float = 1e-5,
         hc_mult: int = 4,
         activation: bool = True,
@@ -151,7 +157,7 @@ class ShortConv(nn.Module):
         super().__init__()
         self.hc_mult = hc_mult
         self.activation = activation
-        
+
         total_channels = hidden_size * hc_mult
 
         self.conv = nn.Conv1d(
@@ -167,11 +173,12 @@ class ShortConv(nn.Module):
         )
         # apply separaete RMSNorm for each group
         self.norms = nn.ModuleList([
-            nn.RMSNorm(hidden_size, eps=norm_eps) 
+            nn.RMSNorm(hidden_size, eps=norm_eps)
             for _ in range(hc_mult)
         ])
 
-        if self.activation: self.act_fn = nn.SiLU()
+        if self.activation:
+            self.act_fn = nn.SiLU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """ Forward pass through the ShortConv layer """
@@ -186,11 +193,12 @@ class ShortConv(nn.Module):
         x_norm = torch.cat(normed_chunks, dim=-1)
 
         x_bct = x_norm.transpose(1, 2)  # prepare tensor for convolution
-        y_bct = self.conv(x_bct)        # apply 1D convolution 
+        y_bct = self.conv(x_bct)        # apply 1D convolution
         y_bct = y_bct[..., :T]          # causal slicing to remove future info
 
-        if self.activation: y_bct = self.act_fn(y_bct)
-        
+        if self.activation:
+            y_bct = self.act_fn(y_bct)
+
         return y_bct.transpose(1, 2).view(B, T, G, C).contiguous()
 
 
@@ -273,4 +281,3 @@ def load_checkpoint(
 
     # Return the iteration number
     return checkpoint['iteration']
-    

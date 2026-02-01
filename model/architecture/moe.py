@@ -1,10 +1,11 @@
 import math
 import torch
+import torch._dynamo
 import torch.nn as nn
 import torch.nn.functional as F
 
 from model.architecture.mlp import MLP
-from model.architecture.moe_kernels import fused_scatter_add_weighted
+from model.architecture.kernels import fused_scatter_add_weighted
 
 
 class Gate(nn.Module):
@@ -29,10 +30,16 @@ class Gate(nn.Module):
         self.seq_alpha = aux_seq_loss_alpha
         self.bias_update_speed = bias_update_speed
 
+        # [OPT] expert_bias is kept in fp32 for precision during updates
+        # We cache a converted version to avoid per-forward dtype conversion
         self.register_buffer('expert_bias', torch.zeros(
             self.n_routed_experts, device=device, dtype=torch.float32))
         self.register_buffer('expert_load', torch.zeros(
             self.n_routed_experts, device=device, dtype=torch.long))
+        # [OPT] Cache for converted bias - lazily populated on first forward
+        self._cached_bias_dtype = None
+        self._cached_bias = None
+
         # initialize gating weights for affinity score calculation
         self.weight = nn.Parameter(torch.empty(
             (self.n_routed_experts, self.hidden_size), device=device, dtype=dtype))
@@ -41,42 +48,55 @@ class Gate(nn.Module):
     def reset_parameters(self) -> None:
         import torch.nn.init as init
         init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        # Invalidate cache when parameters are reset
+        self._cached_bias_dtype = None
+        self._cached_bias = None
+
+    def _get_bias_in_dtype(self, target_dtype: torch.dtype) -> torch.Tensor:
+        """Get expert_bias in the target dtype, using cache to avoid repeated conversions.
+
+        [OPT] During training, bias changes after each step via update_bias().
+        During inference, bias is constant. The cache avoids repeated .to() calls.
+        """
+        if self._cached_bias_dtype != target_dtype or self._cached_bias is None:
+            self._cached_bias = self.expert_bias.to(target_dtype)
+            self._cached_bias_dtype = target_dtype
+        return self._cached_bias
 
     def forward(self, x):
         """ Forward pass with auxiliary-loss-free load balancing """
         bsz, seq_len, _ = x.shape
 
-        # calculate affinity scores for each expert
         x_flat = x.view(-1, x.shape[-1])
-        # use @ operator for compile optimization
+        # calculate affinity scores for each expert
         logits = x_flat @ self.weight.t()
         scores = torch.sigmoid(logits)
 
-        # [OPT] avoid repeated .to() by checking dtype first
-        # add bias term to affinity scores for top-k routing (only for routing)
+        # [OPT] Use cached bias conversion to avoid repeated .to() calls
+        # The cache is invalidated when update_bias() is called
         if self.expert_bias.dtype == logits.dtype:
             biased_logits = logits + self.expert_bias.unsqueeze(0)
         else:
-            biased_logits = logits + self.expert_bias.to(logits.dtype).unsqueeze(0)
+            biased_logits = logits + \
+                self._get_bias_in_dtype(logits.dtype).unsqueeze(0)
 
         # select top-k experts based on biased logits and their unbiased weights
         _, topk_indices = torch.topk(
             biased_logits, k=self.top_k, dim=-1, sorted=False)
         topk_weights = torch.gather(scores, dim=-1, index=topk_indices)
-        # re-normalize the weights of the selected experts
-        if self.top_k > 1:
+        if self.top_k > 1:  # re-normalize the weights of the selected
             denominator = topk_weights.sum(dim=-1, keepdim=True) + 1e-10
             topk_weights = topk_weights / denominator
 
-        # [OPT] compute expert_load ONCE here, reuse in MOE.forward() to avoid duplicate bincount
-        # This saves one bincount + one sync per forward pass
+        # compute expert_load ONCE here, reuse to avoid duplicate
+        # [OPT] Use one_hot + sum instead of bincount - faster for small n_routed_experts
         expert_token_counts = None
         if self.training:
-            expert_token_counts = torch.bincount(
+            # one_hot creates (N, n_experts) then sum along dim=0 gives counts per expert
+            expert_token_counts = F.one_hot(
                 topk_indices.flatten(),
-                minlength=self.n_routed_experts
-            )
-            # store for bias update (no dtype conversion needed, keep as long)
+                num_classes=self.n_routed_experts
+            ).sum(dim=0)
             self.expert_load = expert_token_counts
 
         # calculate sequence-wise auxiliary loss (if alpha > 0)
@@ -102,31 +122,28 @@ class Gate(nn.Module):
         - P_i: average of normalized routing probabilities for expert i (eq. 19-20)
         - α: small hyperparameter weight (seq_alpha)
         """
-        # OPTIMIZED: Let autocast handle dtype - computation in native precision
-        # (bsz, seq_len, n_experts)
-        scores_reshaped = scores.view(bsz, seq_len, self.n_routed_experts)
+        scores_reshaped = scores.view(
+            bsz, seq_len, self.n_routed_experts)  # (bsz, seq_len, n_experts)
         topk_idx_reshaped = topk_idx.view(
             bsz, seq_len, self.top_k)         # (bsz, seq_len, top_k)
 
-        # [OPT] Use F.one_hot - output is already float when scores is float
-        # F.one_hot returns int64 by default, but we can use float computation directly
+        # Use F.one_hot - output is already float when scores is float
         expert_mask = F.one_hot(
             topk_idx_reshaped.view(bsz, -1),  # (bsz, seq_len*top_k)
             num_classes=self.n_routed_experts
         )  # (bsz, seq_len*top_k, n_experts), dtype=int64
 
-        # [OPT] Compute f_i directly with int64 sum, then convert to float at the end
-        # This avoids the expensive .to(scores.dtype) on the large expert_mask tensor
-        expert_counts = expert_mask.sum(dim=1)  # (bsz, n_experts), int64
-        f_i = expert_counts.to(scores.dtype) / (self.top_k * seq_len)  # (bsz, n_experts)
+        # Compute f_i directly with int64 sum, then convert to float at the end
+        expert_counts = expert_mask.sum(dim=1)  # (bsz, n_experts)
+        f_i = expert_counts.to(scores.dtype) / \
+            (self.top_k * seq_len)  # (bsz, n_experts)
 
-        # [OPT] vectorized P_i calculation: (bsz, n_experts):
+        # vectorized P_i calculation: (bsz, n_experts):
         score_sums = scores_reshaped.sum(
             dim=2, keepdim=True)       # (bsz, seq_len, 1)
         normalized_scores = scores_reshaped / \
             (score_sums + 1e-10)  # (bsz, seq_len, n_experts)
-        # (bsz, n_experts)
-        P_i = normalized_scores.mean(dim=1)
+        P_i = normalized_scores.mean(dim=1)  # (bsz, n_experts)
 
         seq_losses = (f_i * P_i).sum(dim=1)  # (bsz,)
         aux_seq_loss = self.seq_alpha * seq_losses.mean()
@@ -148,6 +165,10 @@ class Gate(nn.Module):
         # vectorized bias update: compute difference and update all biases at once
         load_diff = self.expert_load.float() - expected_load
         self.expert_bias -= torch.sign(load_diff) * self.bias_update_speed
+
+        # [OPT] Invalidate cached bias since we just updated it
+        self._cached_bias_dtype = None
+        self._cached_bias = None
 
 
 class MOE(nn.Module):
@@ -193,7 +214,15 @@ class MOE(nn.Module):
         if n_shared_experts > 0:
             self.shared_expert = MLP(d_model, d_ff, device=device, dtype=dtype)
 
+    # @torch._dynamo.disable()
     def forward(self, x):
+        """
+        MoE forward pass with torch.compile disabled.
+
+        Reason: MoE routing is inherently dynamic - the number of tokens per expert
+        varies at runtime. The .tolist() call required by torch.split() causes
+        unavoidable graph breaks. Running in eager mode avoids recompilation overhead.
+        """
         identity = x
         batch_size, seq_len, _ = x.shape
 
@@ -222,32 +251,22 @@ class MOE(nn.Module):
             # permute tokens to match expert group for contiguous memory access
             sorted_tokens = x_flat[sorted_token_idx]
 
-            # Reuse expert_token_counts from Gate eliminates duplicate bincount
-            # compute cumulative offsets: [0, count[0], count[0]+count[1], ...]
-            token_offsets = torch.empty(
-                self.n_routed_experts + 1, device=x_flat.device, dtype=torch.long
-            )
-            token_offsets[0] = 0  # use cumsum directly on GPU then sync
-            token_offsets[1:] = torch.cumsum(expert_token_counts, dim=0)
-            
-            # [OPT] Single sync point - get all offsets at once
-            token_offsets_list = token_offsets.tolist()
+            # Reuse expert_token_counts from Gate - single sync point here
+            # Convert counts to list ONCE for torch.split and loop bounds
+            expert_counts_list = expert_token_counts.tolist()
 
-            # Allocate output buffer for raw expert outputs (without weights)
-            y_sorted = torch.zeros_like(sorted_tokens)
-            for expert_id in range(self.n_routed_experts):
-                start_idx = token_offsets_list[expert_id]
-                end_idx = token_offsets_list[expert_id + 1]
+            # Split sorted_tokens into chunks by expert (no additional sync needed)
+            # torch.split returns a tuple of tensors, one per expert
+            expert_inputs = torch.split(sorted_tokens, expert_counts_list)
 
-                # skip if no tokens assigned to this expert (Python int comparison, no sync)
-                if start_idx == end_idx:
-                    continue
+            # Process each expert and collect outputs
+            expert_outputs = [
+                self.experts[expert_id](expert_inputs[expert_id])
+                for expert_id in range(self.n_routed_experts)
+            ]
 
-                # extract contiguous chunk for locality
-                expert_input = sorted_tokens[start_idx:end_idx]
-                # single forward pass through expert - store RAW output (no weight multiplication)
-                y_sorted[start_idx:end_idx] = self.experts[expert_id](
-                    expert_input)
+            # Concatenate all outputs back together (same order as sorted_tokens)
+            y_sorted = torch.cat(expert_outputs, dim=0)
 
             # Fused Triton kernel: weight multiplication + scatter-add using segment reduction
             # This is MUCH faster than atomic scatter-add because:
@@ -288,53 +307,59 @@ class MOE(nn.Module):
     @torch.no_grad()
     def moe_infer(self, x, flat_expert_indices, flat_expert_weights):
         """Optimized inference logic for Mixture-of-Experts
-        
+
         [OPT] Optimizations applied:
         1. Pre-convert weights dtype once instead of per-expert
-        2. Pre-compute expand index once instead of per-expert repeat
-        3. Avoid redundant dtype conversions in the loop
+        2. Use one_hot + sum instead of bincount
+        3. Use torch.split to avoid cumsum + tolist overhead
+        4. Use expand instead of repeat for memory efficiency
         """
         expert_cache = torch.zeros_like(x)
+
         # sort indices to group tokens by expert
         idxs = flat_expert_indices.argsort()
-        # calculate cumulative token counts per expert
-        counts = flat_expert_indices.bincount(minlength=self.n_routed_experts)
-        
-        # compute offsets and convert to list ONCE to avoid implicit .item() calls
-        token_offsets = torch.empty(self.n_routed_experts + 1, device=x.device, dtype=torch.long)
-        token_offsets[0] = 0
-        token_offsets[1:] = torch.cumsum(counts, dim=0)
-        token_offsets_list = token_offsets.tolist()  # Single sync point
+
+        # Use one_hot + sum instead of bincount: faster for small n_experts
+        counts = F.one_hot(
+            flat_expert_indices,
+            num_classes=self.n_routed_experts
+        ).sum(dim=0)
+
+        # Single sync point - get counts as list for torch.split
+        counts_list = counts.tolist()
 
         token_idxs = idxs // self.num_experts_per_tok
-        
-        # [OPT] Pre-convert weights to match x dtype once (avoid per-expert conversion)
+
+        # [OPT] Pre-convert weights to match x dtype once
         if flat_expert_weights.dtype != x.dtype:
             flat_expert_weights = flat_expert_weights.to(x.dtype)
-        
+
         # [OPT] Pre-compute d_model for index expansion
         d_model = x.shape[-1]
-        
+
+        # Split sorted indices into per-expert chunks
+        token_idx_chunks = torch.split(token_idxs, counts_list)
+        weight_idx_chunks = torch.split(idxs, counts_list)
+
         # loop through the batches of tokens for each expert
+        # [OPT] Remove data-dependent `if count == 0` check to avoid graph breaks
+        # All operations (indexing, expert forward, scatter_add_) handle empty tensors correctly
         for i in range(self.n_routed_experts):
-            start_idx = token_offsets_list[i]
-            end_idx = token_offsets_list[i + 1]
-            if start_idx == end_idx:
-                continue
-            
             expert = self.experts[i]
-            # get the batch of tokens for this expert
-            exp_token_idx = token_idxs[start_idx:end_idx]
+            exp_token_idx = token_idx_chunks[i]
+
+            # get the batch of tokens for this expert (empty tensor if no tokens)
             expert_tokens = x[exp_token_idx]
-            # process the batch and weight the output
+
+            # process the batch and weight the output (works with empty tensors)
             expert_out = expert(expert_tokens)
-            
+
             # [OPT] weights already in correct dtype, no conversion needed
-            weights = flat_expert_weights[idxs[start_idx:end_idx]]
+            weights = flat_expert_weights[weight_idx_chunks[i]]
             expert_out = expert_out * weights
-            
+
             # [OPT] Use expand instead of repeat for memory efficiency (no copy)
-            # expand creates a view while repeat creates a copy
+            # scatter_add_ with empty indices is a no-op (correct behavior)
             scatter_idx = exp_token_idx.unsqueeze(1).expand(-1, d_model)
             expert_cache.scatter_add_(0, scatter_idx, expert_out)
 

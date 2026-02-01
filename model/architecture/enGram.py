@@ -28,8 +28,9 @@ class NgramHashMapping:
     2. N-gram Aggregation (Creating windows of history)
     3. Multi-Head Hashing (Mapping N-grams to table indices)
     """
+
     def __init__(
-        self, 
+        self,
         engram_vocab_size,
         max_ngram_size,
         n_embed_per_ngram,
@@ -37,30 +38,33 @@ class NgramHashMapping:
         layer_ids,
         tokenizer_path,
         pad_id,
-        seed,  
+        seed,
     ):
         self.vocab_size_per_ngram = engram_vocab_size  # vocab size per n-gram order
         self.max_ngram_size = max_ngram_size           # maximum n-gram order
-        self.n_embed_per_ngram = n_embed_per_ngram  # embedding dimension per n-gram order
-        self.n_head_per_ngram = n_head_per_ngram    # number of hash head per n-gram order
+        # embedding dimension per n-gram order
+        self.n_embed_per_ngram = n_embed_per_ngram
+        # number of hash head per n-gram order
+        self.n_head_per_ngram = n_head_per_ngram
         self.pad_id = pad_id
         self.layer_ids = layer_ids
 
         # initalize compressed tokenizer, which map raw tokens to canonical tokens
         self.compressed_tokenizer = CompressedTokenizer(
             tokenizer_path=tokenizer_path
-        )            
+        )
         self.tokenizer_vocab_size = len(self.compressed_tokenizer)
         # ensure pad_id is also converted to canonical id form
         if self.pad_id is not None:
-            self.pad_id = int(self.compressed_tokenizer.lookup_table[self.pad_id])
-        
+            self.pad_id = int(
+                self.compressed_tokenizer.lookup_table[self.pad_id])
+
         # generate deterministic odd multipliers for hash function.
         max_long = np.iinfo(np.int64).max
         M_max = int(max_long // self.tokenizer_vocab_size)
         half_bound = max(1, M_max // 2)
         PRIME_1 = 10007
-        
+
         # create unique odd multipliers for each layer
         self.layer_multipliers = {}
         for layer_id in self.layer_ids:
@@ -87,7 +91,7 @@ class NgramHashMapping:
         """
         seen_primes = set()
         vocab_size_across_layers = {}
-        
+
         for layer_id in self.layer_ids:
             all_ngram_vocab_sizes = []
             # iterate through n-grams orders
@@ -100,7 +104,7 @@ class NgramHashMapping:
                 # for each head, find the next prime number
                 for _ in range(num_head):
                     found_prime = find_next_prime(
-                        current_prime_search_start, 
+                        current_prime_search_start,
                         seen_primes
                     )
                     seen_primes.add(found_prime)
@@ -126,12 +130,13 @@ class NgramHashMapping:
 
         def shift_k(k: int) -> np.ndarray:
             ''' create shifted views of the input for N-gram creation '''
-            if k == 0: return x
+            if k == 0:
+                return x
             shifted = np.pad(x, ((0, 0), (k, 0)),
-                                mode='constant', constant_values=self.pad_id)[:, :T]
+                             mode='constant', constant_values=self.pad_id)[:, :T]
             return shifted
 
-        # precompute all shifted tokens of the input sequence 
+        # precompute all shifted tokens of the input sequence
         base_shifts = [shift_k(k) for k in range(self.max_ngram_size)]
 
         all_hashes = []
@@ -163,7 +168,8 @@ class NgramHashMapping:
         # compute hashes for all layers
         hash_ids_for_all_layers = {}
         for layer_id in self.layer_ids:
-            hash_ids_for_all_layers[layer_id] = self._get_ngram_hashes(input_ids, layer_id=layer_id)
+            hash_ids_for_all_layers[layer_id] = self._get_ngram_hashes(
+                input_ids, layer_id=layer_id)
         return hash_ids_for_all_layers
 
 
@@ -171,13 +177,14 @@ class MultiHeadEmbedding(nn.Module):
     """
     This class implements multiple independent embedding tables efficiently by packing them 
     into a single, large physical `nn.Embedding` layer.
-    
+
     Instead of using a `nn.ModuleList` of K separate embedding layers (which would require K 
     separate kernel launches), we use one giant table and manage access via index offsetting.
-    
+
     This is crucial for the "Multi-Head Hashing" mechanism in Engram, ensuring high 
     GPU throughput (O(1) lookup).
     """
+
     def __init__(self, list_of_N: List[int], D: int):
         super().__init__()
         self.num_heads = len(list_of_N)
@@ -186,7 +193,8 @@ class MultiHeadEmbedding(nn.Module):
         offsets = [0]
         for n in list_of_N[:-1]:
             offsets.append(offsets[-1] + n)
-        self.register_buffer("offsets", torch.tensor(offsets, dtype=torch.long))
+        self.register_buffer(
+            "offsets", torch.tensor(offsets, dtype=torch.long))
         # calculate the total size and initalize a single embedding table
         total_N = sum(list_of_N)
         self.embedding = nn.Embedding(num_embeddings=total_N, embedding_dim=D)
@@ -203,7 +211,8 @@ class Engram(nn.Module):
     Engram Module, which implements the Conditional Memory mechanism.
     It orchestrates hashing, embedding lookup, and context-aware gating fusion.
     """
-    def __init__(self, 
+
+    def __init__(self,
                  layer_id,     # index of current layer
                  layer_ids,    # list of layer IDs
                  hidden_size,  # model's hidden dimension
@@ -216,7 +225,7 @@ class Engram(nn.Module):
                  tokenizer_path,      # path to tokenizer
                  pad_id,
                  seed
-                ):
+                 ):
         super().__init__()
         self.layer_id = layer_id
         self.hc_mult = hc_mult
@@ -224,41 +233,49 @@ class Engram(nn.Module):
         # create n-gram hash mapping
         self.hash_mapping = NgramHashMapping(
             engram_vocab_size=vocab_size,
-            max_ngram_size = ngram_size,
-            n_embed_per_ngram = embd_dim_per_ngram,
-            n_head_per_ngram  = head_num_per_ngram,
-            layer_ids = layer_ids,
+            max_ngram_size=ngram_size,
+            n_embed_per_ngram=embd_dim_per_ngram,
+            n_head_per_ngram=head_num_per_ngram,
+            layer_ids=layer_ids,
             tokenizer_path=tokenizer_path,
-            pad_id = pad_id,
-            seed = seed,
+            pad_id=pad_id,
+            seed=seed,
         )
         # initialize multi-head embedding
         self.multi_head_embedding = MultiHeadEmbedding(
-            list_of_N = [x for y in self.hash_mapping.vocab_size_across_layers[self.layer_id] for x in y],
-            D = embd_dim_per_ngram // head_num_per_ngram,
+            list_of_N=[
+                x for y in self.hash_mapping.vocab_size_across_layers[self.layer_id] for x in y],
+            D=embd_dim_per_ngram // head_num_per_ngram,
         )
         # initialize short convolution
         self.short_conv = ShortConv(
-            hidden_size = hidden_size,
-            kernel_size = kernel_size,
-            dilation    = ngram_size,
-            hc_mult     = hc_mult,
+            hidden_size=hidden_size,
+            kernel_size=kernel_size,
+            dilation=ngram_size,
+            hc_mult=hc_mult,
         )
         # calculate hidden size and initalize projection layers:
         engram_hidden_size = (ngram_size-1) * embd_dim_per_ngram
         self.value_proj = nn.Linear(engram_hidden_size, hidden_size)
         self.key_projs = nn.ModuleList(
-            [nn.Linear(engram_hidden_size, hidden_size) for _ in range(hc_mult)]
+            [nn.Linear(engram_hidden_size, hidden_size)
+             for _ in range(hc_mult)]
         )
-        self.norm1 = nn.ModuleList([nn.RMSNorm(hidden_size) for _ in range(hc_mult)])
-        self.norm2 = nn.ModuleList([nn.RMSNorm(hidden_size) for _ in range(hc_mult)])
-    
+        self.norm1 = nn.ModuleList([nn.RMSNorm(hidden_size)
+                                   for _ in range(hc_mult)])
+        self.norm2 = nn.ModuleList([nn.RMSNorm(hidden_size)
+                                   for _ in range(hc_mult)])
+
     def forward(self, hidden_states, input_ids):
         # retrieve hash indices for current layer and convert to tensor
-        hash_input_ids = torch.from_numpy(self.hash_mapping.hash(input_ids)[self.layer_id])
+        hash_input_ids = torch.from_numpy(
+            self.hash_mapping.hash(input_ids)[self.layer_id])
+        # move to the same device as the model
+        hash_input_ids = hash_input_ids.to(hidden_states.device)
         # lookup embeddings and flatten across n-gram heads
-        embeddings = self.multi_head_embedding(hash_input_ids).flatten(start_dim=-2)
-        
+        embeddings = self.multi_head_embedding(
+            hash_input_ids).flatten(start_dim=-2)
+
         # compute gates for each hyper-connection
         gates = []
         for hc_idx in range(self.hc_mult):
@@ -266,16 +283,17 @@ class Engram(nn.Module):
             key = self.key_projs[hc_idx](embeddings)
             normed_key = self.norm1[hc_idx](key)
             # extract and normalize backbone states
-            query = hidden_states[:,:,hc_idx,:]
+            query = hidden_states[:, :, hc_idx, :]
             normed_query = self.norm2[hc_idx](query)
             # compute gate score
-            gate = (normed_key * normed_query).sum(dim=-1) / math.sqrt(self.hidden_size)
+            gate = (normed_key * normed_query).sum(dim=-1) / \
+                math.sqrt(self.hidden_size)
             # activation with stabilized sqrt-sigmoid
             gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
             gate = gate.sigmoid().unsqueeze(-1)
             gates.append(gate)
-        
-        gates = torch.stack(gates,dim=2)
+
+        gates = torch.stack(gates, dim=2)
         # apply gates to retrieved value projections
         value = gates * self.value_proj(embeddings).unsqueeze(2)
         # perform short convolution and return

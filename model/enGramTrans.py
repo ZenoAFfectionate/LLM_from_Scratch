@@ -56,12 +56,12 @@ class Block(nn.Module):
         if config.attention_type == "MHA":
             self.att = MultiHeadSelfAttention(
                 config.d_model, config.num_heads, rope,
-                use_gate=False, device=device, dtype=dtype
+                device=device, dtype=dtype
             )
         elif config.attention_type == "GQA":
             self.att = GroupedQueryAttention(
                 config.d_model, config.num_heads, config.num_kv_heads, rope,
-                use_gate=False, device=device, dtype=dtype
+                device=device, dtype=dtype
             )
         elif config.attention_type == "MLA":
             self.att = MultiHeadLatentAttention(
@@ -71,7 +71,6 @@ class Block(nn.Module):
                 rope_dim=config.rope_dim,
                 q_lora_rank=config.q_lora_rank,
                 kv_lora_rank=config.kv_lora_rank,
-                use_gate=False,
                 device=device,
                 dtype=dtype
             )

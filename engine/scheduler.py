@@ -5,6 +5,7 @@ from engine.block_manager import BlockManager
 
 class Scheduler:
     """Scheduler for managing and scheduling sequences for generation."""
+
     def __init__(self, max_num_sequences: int, max_num_batched_tokens: int, max_cached_blocks: int, block_size: int, eos: int):
         # initialize block manager and set max parameters
         self.block_manager = BlockManager(max_cached_blocks, block_size)
@@ -15,13 +16,11 @@ class Scheduler:
         self.running: deque[Sequence] = deque()
         self.eos = eos
 
-
     def is_finished(self):
         return len(self.waiting) == 0 and len(self.running) == 0
-    
+
     def add_sequence(self, sequence: Sequence):
         self.waiting.append(sequence)
-
 
     def schedule(self) -> tuple[list[Sequence], bool]:
         """Schedule sequences for the next generation step."""
@@ -32,9 +31,10 @@ class Scheduler:
         while self.waiting and len(scheduled_sequences) < self.max_num_sequences:
             seq = self.waiting[0]
             if (self.block_manager.can_allocate(seq) and
-                len(seq) + current_scheduled_tokens <= self.max_num_batched_tokens):
+                    len(seq) + current_scheduled_tokens <= self.max_num_batched_tokens):
                 seq = self.waiting.popleft()      # remove from waiting queue
-                self.block_manager.allocate(seq)  # allocate blocks for sequence
+                # allocate blocks for sequence
+                self.block_manager.allocate(seq)
                 seq.status = SequenceStatus.RUNNING
                 self.running.append(seq)          # add to running queue
                 scheduled_sequences.append(seq)   # schedule to prefilling
@@ -44,7 +44,7 @@ class Scheduler:
         # return any sequences scheduled for prefilling
         if scheduled_sequences:
             return scheduled_sequences, True
-        
+
         # try to schedule for completion from running queue
         while self.running:
             seq = self.running.popleft()
@@ -56,25 +56,25 @@ class Scheduler:
                     self.preempt(seq)
                     break
             else:
-                if (current_scheduled_tokens >= self.max_num_batched_tokens or 
-                    len(scheduled_sequences) >= self.max_num_sequences):
+                if (current_scheduled_tokens >= self.max_num_batched_tokens or
+                        len(scheduled_sequences) >= self.max_num_sequences):
                     break
-                self.block_manager.append(seq)   # append one token for sequence
-                scheduled_sequences.append(seq)  # add sequence to scheduled list
+                # append one token for sequence
+                self.block_manager.append(seq)
+                # add sequence to scheduled list
+                scheduled_sequences.append(seq)
                 current_scheduled_tokens += 1    # update token count
         # re-add to running queue in the same order
-        if scheduled_sequences: 
+        if scheduled_sequences:
             self.running.extendleft(reversed(scheduled_sequences))
 
         return scheduled_sequences, False
-
 
     def preempt(self, seq: Sequence) -> None:
         '''Preempt a running seq and move it back to waiting queue'''
         self.block_manager.deallocate(seq)  # deallocate blocks for sequence
         seq.status = SequenceStatus.WAITING
         self.waiting.appendleft(seq)        # add back to waiting queue
-
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int]) -> None:
         '''Check whether sequences are finished after generation'''

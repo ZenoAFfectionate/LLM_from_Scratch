@@ -14,10 +14,12 @@ class SamplingParams:
                     Must be > 0 (greedy sampling not permitted).
         max_tokens: Maximum number of tokens to generate.
         ignore_eos: If True, continue generating even after EOS token.
+        max_model_length: Maximum context length the model supports.
     """
     temperature: float = 1.0
     max_tokens: int = 256
     ignore_eos: bool = False
+    max_model_length: int = 2048
 
     def __post_init__(self):
         assert self.temperature > 1e-10, "greedy sampling is not permitted"

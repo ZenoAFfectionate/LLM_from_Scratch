@@ -5,18 +5,27 @@ import torch.distributed as dist
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
-from models.qwen3 import Qwen3ForCausalLM
-from myvllm.layers.sampler import SamplerLayer
+from model.transformer import TransformerLM
+from model.config import Config
 from engine.sequence import Sequence
-from myvllm.utils import *
+from utils.context import set_context, get_context, reset_context
+from utils.sampler import Sampler
 
 
 # =========================================================
-# This Part of Code should be modified to fit our own model
+# ModelRunner adapted for TransformerLM with Paged Attention
 # =========================================================
 
 
 class ModelRunner:
+    """
+    ModelRunner for running the TransformerLM model with paged attention.
+    
+    Key adaptations:
+    - Uses TransformerLM instead of Qwen3ForCausalLM
+    - Maps Config parameters to engine config format
+    - Allocates paged KV cache and assigns to attention layers
+    """
     def __init__(self, config: dict, rank: int, event: Event | list[Event]):
         self.config = config
         self.event = event
@@ -30,27 +39,41 @@ class ModelRunner:
         dist.init_process_group('nccl', "tcp://localhost:12345", world_size=config['world_size'], rank=rank)
         torch.cuda.set_device(rank)
 
-        # set model
-        self.model = Qwen3ForCausalLM(
+        # Build model config from engine config
+        model_config = Config(
             vocab_size=config['vocab_size'],
-            hidden_size=config['hidden_size'],
-            num_heads=config['num_heads'],
-            head_dim=config['head_dim'],
-            scale=config['scale'],
-            num_kv_heads=config['num_kv_heads'],
-            rms_norm_epsilon=config['rms_norm_epsilon'],
-            qkv_bias=config['qkv_bias'],
-            base=config['base'],
-            max_position=config['max_position'],
-            intermediate_size=config['intermediate_size'],
-            ffn_bias=config['ffn_bias'],
+            context_length=config['max_model_length'],
+            d_model=config['hidden_size'],
             num_layers=config['num_layers'],
-            tie_word_embeddings=config['tie_word_embeddings'],
+            num_heads=config['num_heads'],
+            num_kv_heads=config.get('num_kv_heads', config['num_heads']),
+            d_ff=config.get('intermediate_size', config['hidden_size'] * 4),
+            dropout=0.0,  # No dropout during inference
+            attention_type=config.get('attention_type', 'GQA'),
+            rope_theta=config.get('rope_theta', 10000.0),
+            rope_dim=config.get('rope_dim', None),
+            q_lora_rank=config.get('q_lora_rank', None),
+            kv_lora_rank=config.get('kv_lora_rank', None),
+            use_moe=config.get('use_moe', False),
+            n_routed_experts=config.get('n_routed_experts', 8),
+            num_experts_per_tok=config.get('num_experts_per_tok', 1),
+            n_shared_experts=config.get('n_shared_experts', 1),
+        )
+        
+        # Create model with paged attention enabled
+        self.model = TransformerLM(
+            config=model_config,
+            device=f'cuda:{rank}',
+            dtype=torch.bfloat16,
         ).cuda(rank)
-        self.sampler = SamplerLayer()
+        
+        # Enable paged attention mode on all attention layers
+        self._enable_paged_attention()
+        
+        self.sampler = Sampler()
 
         # Store default dtype before it's needed in allocate_kv_cache
-        self.default_dtype = torch.get_default_dtype()
+        self.default_dtype = torch.bfloat16  # Use bfloat16 for KV cache
 
         # warm up model so that we know peak memory usage
         self.warmup_model()
@@ -59,8 +82,8 @@ class ModelRunner:
         # capture cuda graph for decoding
         if not self.enforce_eager:
             self.capture_cudagraph()
-
-        torch.set_default_device(f'cuda:{rank}')
+    
+        torch.set_default_device(f'cuda:{self.rank}')
         torch.set_default_dtype(self.default_dtype)
 
         # IMPORTANT: Set up shared memory and barrier AFTER all model initialization
@@ -85,6 +108,17 @@ class ModelRunner:
                 self.shm = SharedMemory(name='myvllm')
                 # Don't call self.loop() here - let the spawning code handle it
                 # Otherwise we'll be stuck in an infinite loop during __init__
+    
+    def _enable_paged_attention(self):
+        """Enable paged attention mode on all attention layers."""
+        for layer in self.model.layers:
+            if hasattr(layer, 'att'):
+                # Set paged attention flag
+                layer.att.paged_attention = True
+                # Set block size for paged attention
+                layer.att.block_size = self.block_size
+                # Disable the old per-sequence cache
+                layer.att.cache_enabled = False
 
     # only use read when rank != 0
     def read_shm(self):
@@ -170,24 +204,61 @@ class ModelRunner:
         
         # find parameters to compute kv cache size
         num_layers = self.config['num_layers']
-        num_kv_heads = self.config['num_kv_heads'] // self.world_size
-        head_dim = self.config['head_dim'] if 'head_dim' in self.config else self.config['hidden_size'] // self.config['num_heads']
-
-        # check whether the current free memory can hold at least one block
-        # compute the actual byte required of each block
-        block_bytes = self.block_size * 2 * num_layers * num_kv_heads * head_dim * self.default_dtype.itemsize
+        num_kv_heads = self.config.get('num_kv_heads', self.config['num_heads']) // self.world_size
+        head_dim = self.config.get('head_dim', self.config['hidden_size'] // self.config['num_heads'])
+        
+        # For MLA attention, the KV cache stores compressed representations
+        attention_type = self.config.get('attention_type', 'GQA')
+        if attention_type == 'MLA':
+            # MLA caches kv_lora_rank + rope_dim instead of 2 * num_kv_heads * head_dim
+            kv_lora_rank = self.config.get('kv_lora_rank', self.config['hidden_size'] // 4)
+            rope_dim = self.config.get('rope_dim', 16)
+            cache_dim = kv_lora_rank + rope_dim  # compressed KV + position encoding
+            # MLA uses different cache structure: (kv_compressed, pe)
+            block_bytes = self.block_size * num_layers * cache_dim * self.default_dtype.itemsize
+        else:
+            # GQA/MHA: standard K and V caches
+            # block_bytes = block_size * 2(K+V) * num_layers * num_kv_heads * head_dim * dtype_size
+            block_bytes = self.block_size * 2 * num_layers * num_kv_heads * head_dim * self.default_dtype.itemsize
+        
         self.num_available_kv_blocks = int(available_mem // block_bytes)
         assert self.num_available_kv_blocks >= 1, f'Not enough memory to hold at least one block of KV cache on rank {self.rank}'
+        
+        print(f"[Rank {self.rank}] Allocated {self.num_available_kv_blocks} KV cache blocks "
+              f"(block_size={self.block_size}, attention_type={attention_type})")
 
-        # allocate max possible kv cache for the model, instead for each sequence
+        # allocate max possible kv cache for the model
         # this is the key for paged attention: one giant KV cache pool, divided into blocks
-        allocated_kv_cache = torch.empty(2, self.config['num_layers'], self.num_available_kv_blocks, self.block_size, num_kv_heads, head_dim, device=f'cuda:{self.rank}')
-        layer_id = 0
-        for module in self.model.modules():
-            if hasattr(module, 'k_cache') and hasattr(module, 'v_cache'):
-                module.k_cache = allocated_kv_cache[0, layer_id]
-                module.v_cache = allocated_kv_cache[1, layer_id]
-                layer_id += 1
+        if attention_type == 'MLA':
+            # MLA: separate kv_cache and pe_cache
+            # Shape: (num_layers, num_blocks, block_size, cache_dim)
+            kv_cache = torch.empty(
+                num_layers, self.num_available_kv_blocks, self.block_size, kv_lora_rank,
+                device=f'cuda:{self.rank}', dtype=self.default_dtype
+            )
+            pe_cache = torch.empty(
+                num_layers, self.num_available_kv_blocks, self.block_size, rope_dim,
+                device=f'cuda:{self.rank}', dtype=self.default_dtype
+            )
+            layer_id = 0
+            for layer in self.model.layers:
+                if hasattr(layer, 'att'):
+                    layer.att.k_cache = kv_cache[layer_id]  # kv compressed
+                    layer.att.v_cache = pe_cache[layer_id]  # position encoding
+                    layer_id += 1
+        else:
+            # GQA/MHA: standard K and V caches
+            # Shape: (2, num_layers, num_blocks, block_size, num_kv_heads, head_dim)
+            allocated_kv_cache = torch.empty(
+                2, num_layers, self.num_available_kv_blocks, self.block_size, num_kv_heads, head_dim,
+                device=f'cuda:{self.rank}', dtype=self.default_dtype
+            )
+            layer_id = 0
+            for layer in self.model.layers:
+                if hasattr(layer, 'att'):
+                    layer.att.k_cache = allocated_kv_cache[0, layer_id]
+                    layer.att.v_cache = allocated_kv_cache[1, layer_id]
+                    layer_id += 1
 
     # given seqs
     # prepare the data needed for a prefill forward pass
@@ -264,7 +335,8 @@ class ModelRunner:
         for i, seq in enumerate(seqs):
             block_table = seq.block_table + [-1]*(max_num_blocks - len(seq.block_table))
             block_tables.append(block_table)
-        input_ids = torch.tensor(input_ids, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
+        # TransformerLM expects (batch_size, seq_len), so reshape to (batch_size, 1)
+        input_ids = torch.tensor(input_ids, dtype=torch.long, pin_memory=True).cuda(non_blocking=True).unsqueeze(1)
         set_context(
             is_prefill=False,
             cu_seqlens_q=None,
@@ -288,10 +360,15 @@ class ModelRunner:
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, is_prefill: bool) -> torch.Tensor:
         if is_prefill or self.enforce_eager:
-            # For varlen prefill, keep input_ids as 1D (concatenated tokens)
-            # Do NOT unsqueeze - flash_attn_varlen_func expects 1D input with cu_seqlens
-            logits = self.model.compute_logits(self.model(input_ids))
+            # For prefill with paged attention:
+            # - input_ids shape depends on implementation
+            # TransformerLM.forward expects (batch, seq_len)
+            # For varlen prefill, we use batch=1 and concatenate all tokens
+            if input_ids.dim() == 1:
+                input_ids = input_ids.unsqueeze(0)  # (1, total_tokens)
+            logits = self.model(input_ids)
         else:
+            # Decode phase with CUDA graph
             bs = input_ids.size(0)
             context = get_context()
 
@@ -299,15 +376,17 @@ class ModelRunner:
             graph = self.graphs[next(bs_ for bs_ in self.graphs.keys() if bs_ >= bs)]
             vars = self.graph_vars
             # copy input data into graph variables
+            # input_ids shape: (batch_size, 1) for decode
             vars['input_ids'][:bs].copy_(input_ids)
             vars['slot_mapping'][:bs].fill_(-1)
             vars['slot_mapping'][:bs].copy_(context.slot_mapping)
             vars["context_lens"].zero_()
             vars['context_lens'][:bs].copy_(context.context_lens)
+            vars["block_tables"].zero_()
             vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
             # replay the graph
             graph.replay()
-            logits = self.model.compute_logits(vars['outputs'][:bs])
+            logits = vars['outputs'][:bs].clone()
 
         return logits
 
@@ -323,6 +402,21 @@ class ModelRunner:
         else:
             input_ids = self.prepare_decode(seqs)
         logits = self.run_model(input_ids, is_prefill)
+        
+        # Handle different logits shapes
+        # TransformerLM returns (batch, seq_len, vocab_size)
+        if logits.dim() == 3:
+            # For prefill: get last token logits for each sequence
+            if is_prefill:
+                context = get_context()
+                # Extract last token logits for each sequence based on cu_seqlens_q
+                cu_seqlens = context.cu_seqlens_q
+                last_positions = cu_seqlens[1:] - 1  # positions of last tokens
+                logits = logits.squeeze(0)[last_positions]  # (num_seqs, vocab_size)
+            else:
+                # For decode: squeeze the seq_len dimension
+                logits = logits.squeeze(1)  # (batch, vocab_size)
+        
         # only sample when rank == 0
         token_ids = None
         if self.rank == 0:
@@ -331,7 +425,7 @@ class ModelRunner:
         return token_ids
 
     # capture the CUDA graph:
-    # pre-allocation at maximum sizes: allocated onece and reuse for all graphs
+    # pre-allocation at maximum sizes: allocated once and reuse for all graphs
     # capture for different common batch sizes: [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
     # with torch.cuda.graph(graph, self.graph_pool):
     #        run model() and exact sequence of CUDA kernels for running self.model() will be captured
@@ -341,8 +435,10 @@ class ModelRunner:
         max_bs = self.config['max_num_seqs']
         max_len = self.config['max_model_length']
         max_num_blocks = math.ceil(max_len / self.block_size)
+        
         # for decoding, input is always of shape (batch_size, 1)
-        input_ids = torch.zeros(max_bs, dtype=torch.long, device=f'cuda:{self.rank}')
+        # Note: TransformerLM expects (batch_size, seq_len), so we use (batch_size, 1) for decode
+        input_ids = torch.zeros(max_bs, 1, dtype=torch.long, device=f'cuda:{self.rank}')
         # for paged attention
         # where to write new KV values in the cache
         slot_mapping = torch.zeros(max_bs, dtype=torch.long, device=f'cuda:{self.rank}')
@@ -350,8 +446,8 @@ class ModelRunner:
         context_lens = torch.zeros(max_bs, dtype=torch.long, device=f'cuda:{self.rank}')
         # where to read KV values in the cache
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32, device=f'cuda:{self.rank}')
-        # output logits
-        outputs = torch.zeros(max_bs, self.config['vocab_size'], device=f'cuda:{self.rank}')
+        # output logits - TransformerLM returns (batch, seq_len, vocab_size)
+        outputs = torch.zeros(max_bs, 1, self.config['vocab_size'], device=f'cuda:{self.rank}', dtype=self.default_dtype)
 
         # graphs to be captured for different batch sizes
         batch_sizes = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
@@ -370,6 +466,7 @@ class ModelRunner:
                 context_lens=context_lens[:batch_size],
                 block_tables=block_tables[:batch_size],
             )
+            # Warmup run before capture
             outputs[:batch_size] = self.model(input_ids[:batch_size])
 
             with torch.cuda.graph(graph, graph_pool):

@@ -9,7 +9,7 @@ from model.architecture.moe import MOE
 from model.attention.MHA import MultiHeadSelfAttention
 from model.attention.GQA import GroupedQueryAttention
 from model.attention.MLA import MultiHeadLatentAttention
-# from model.attention.DSA import DeepseekSparseAttention
+from model.attention.DSA import DeepseekSparseAttention
 
 
 # ----------------------------------------
@@ -34,12 +34,12 @@ class Block(nn.Module):
         if config.attention_type == "MHA":
             self.att = MultiHeadSelfAttention(
                 config.d_model, config.num_heads, rope,
-                use_gate=False, device=device, dtype=dtype
+                device=device, dtype=dtype
             )
         elif config.attention_type == "GQA":
             self.att = GroupedQueryAttention(
                 config.d_model, config.num_heads, config.num_kv_heads, rope,
-                use_gate=False, device=device, dtype=dtype
+                device=device, dtype=dtype
             )
         elif config.attention_type == "MLA":
             self.att = MultiHeadLatentAttention(
@@ -49,22 +49,25 @@ class Block(nn.Module):
                 rope_dim=config.rope_dim,
                 q_lora_rank=config.q_lora_rank,
                 kv_lora_rank=config.kv_lora_rank,
-                use_gate=False,
                 device=device,
                 dtype=dtype
             )
-        # elif config.attention_type == "DSA":
-        #     self.att = DeepseekSparseAttention(
-        #         d_model=config.d_model,
-        #         head_num=config.num_heads,
-        #         rope=rope,
-        #         rope_dim=config.rope_dim,
-        #         q_lora_rank=config.q_lora_rank,
-        #         kv_lora_rank=config.kv_lora_rank,
-        #         index_topk=128,
-        #         device=device,
-        #         dtype=dtype
-        #     )
+        elif config.attention_type == "DSA":
+            # DeepSeek Sparse Attention - extends MLA with lightning indexer
+            index_topk = getattr(config, 'index_topk', 256)
+            scale_fmt = getattr(config, 'scale_fmt', 'ue8m0')
+            self.att = DeepseekSparseAttention(
+                d_model=config.d_model,
+                head_num=config.num_heads,
+                rope=rope,
+                rope_dim=config.rope_dim,
+                q_lora_rank=config.q_lora_rank,
+                kv_lora_rank=config.kv_lora_rank,
+                index_topk=index_topk,
+                scale_fmt=scale_fmt,
+                device=device,
+                dtype=dtype
+            )
 
         # Choose between standard FFN and MoE FFN
         if use_moe:
@@ -107,7 +110,11 @@ class Block(nn.Module):
             x, residual = self.att_norm(x), x
         else:
             x, residual = self.att_norm(x, residual)
-        x = self.att(x, start_pos, mask)
+        
+        if self.attention_type == "DSA":
+            x, _ = self.att(x, start_pos, mask, use_sparse=True)
+        else:
+            x = self.att(x, start_pos, mask)
         x = self.dropout(x)
 
         # Fused Add & Norm for FFN
@@ -138,9 +145,12 @@ class TransformerLM(nn.Module):
 
         # Model weights are always FP32 for stability. Mixed precision only affects forward pass via autocast.
         self.token_embeddings = Embedding(config.vocab_size, config.d_model, device=device, dtype=dtype)
+        
+        rope_dim = config.d_model // config.num_heads
+        if config.attention_type in ("MLA", "DSA"): rope_dim = config.rope_dim
         self.rope = RotaryPositionalEmbedding(
             config.rope_theta,
-            config.d_model // config.num_heads,
+            rope_dim,
             config.context_length,
             device=device
         )

@@ -1,3 +1,17 @@
+"""
+Training script for enGramTransformer using Muon optimizer for hidden 2D weights 
+and AdamW for other parameters (embeddings, Engram tables, etc.).
+
+This script is specifically designed for training models with the Engram module,
+which implements Conditional Memory via Scalable Lookup as described in the paper:
+"Conditional Memory via Scalable Lookup: A New Axis of Sparsity for Large Language Models"
+
+Key differences from standard training:
+- Engram embedding tables are trained with AdamW (not Muon)
+- Hash computation happens on CPU, embeddings lookup on GPU
+- Additional logging for Engram-specific metrics
+"""
+
 import os
 import json
 import time
@@ -10,15 +24,15 @@ import torch
 import torch.nn as nn
 import wandb
 
-from torch.optim import AdamW
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.nn.utils import clip_grad_norm_
 
 from model.config import Config
-from model.transformer import TransformerLM
+from model.enGramTrans import TransformerLM  # Import Engram-enabled Transformer
 from model.tokenizer.bpe_tokenizer import Tokenizer
 from data.lm_dataset import PretrainDataset
+from model.optimizer.Muon import MuonAdamWOptimizer
 from model.utils import (
     save_checkpoint, load_checkpoint,
     cos_learning_rate_schedule_with_warmup
@@ -49,14 +63,14 @@ def prepare_data(config: Dict[str, Any]):
     return train_data, valid_data
 
 
-def train(model: nn.Module, optimizer: torch.optim.Optimizer,
+def train(model: nn.Module, optimizer: MuonAdamWOptimizer,
           train_loader_iter: Iterator, config: Dict[str, Any], device: torch.device,
           gradient_accumulation_steps: int = 1, accumulation_step: int = 0):
     """Perform a single training step with BF16 mixed precision and gradient accumulation
 
     Args:
         model: The model to train
-        optimizer: The optimizer
+        optimizer: The MuonAdamW optimizer
         train_loader_iter: Iterator from the training DataLoader
         config: Configuration dictionary
         device: Device to run on
@@ -64,8 +78,7 @@ def train(model: nn.Module, optimizer: torch.optim.Optimizer,
         accumulation_step: Current accumulation step (0 to gradient_accumulation_steps-1)
 
     Returns:
-        Tuple of (loss_tensor, grad_norm_tensor) - detached tensors for async logging
-        Call .item() only when actually logging to avoid GPU-CPU sync overhead
+        Tuple of (loss, grad_norm) where grad_norm is only valid on the last accumulation step
     """
     model.train()
 
@@ -94,18 +107,16 @@ def train(model: nn.Module, optimizer: torch.optim.Optimizer,
     loss.backward()  # accumulate gradients without optimize
 
     # only update weights and clip gradients on the last accumulation step
-    grad_norm = torch.tensor(0.0, device=device)
+    grad_norm = torch.tensor(0.0)
     if accumulation_step == gradient_accumulation_steps - 1:
         grad_norm = clip_grad_norm_(model.parameters(), config['max_grad_norm'])
         optimizer.step()
 
-        # update expert biases for load balance
+        # update expert biases for load balance (if using MoE)
         if hasattr(model, 'update_moe_biases'):
             model.update_moe_biases()
 
-    # Return detached tensors - NO .item() call here to avoid GPU-CPU sync
-    # The caller should only call .item() when actually logging
-    return (loss.detach() * gradient_accumulation_steps, grad_norm.detach())
+    return loss.item() * gradient_accumulation_steps, grad_norm.item()
 
 
 def valid(model: nn.Module, val_loader: DataLoader, config: Dict[str, Any], device: torch.device):
@@ -144,16 +155,78 @@ def valid(model: nn.Module, val_loader: DataLoader, config: Dict[str, Any], devi
     return avg_loss, perplexity
 
 
+def count_engram_parameters(model: nn.Module) -> Dict[str, int]:
+    """Count and categorize Engram-related parameters"""
+    engram_embedding_params = 0
+    engram_proj_params = 0
+    engram_conv_params = 0
+    engram_norm_params = 0
+    
+    for name, param in model.named_parameters():
+        if 'engram' in name.lower():
+            if 'multi_head_embedding' in name or 'embedding' in name.lower():
+                engram_embedding_params += param.numel()
+            elif 'value_proj' in name or 'key_proj' in name:
+                engram_proj_params += param.numel()
+            elif 'short_conv' in name or 'conv' in name.lower():
+                engram_conv_params += param.numel()
+            elif 'norm' in name.lower():
+                engram_norm_params += param.numel()
+    
+    return {
+        'engram_embedding': engram_embedding_params,
+        'engram_projection': engram_proj_params,
+        'engram_conv': engram_conv_params,
+        'engram_norm': engram_norm_params,
+        'engram_total': engram_embedding_params + engram_proj_params + engram_conv_params + engram_norm_params
+    }
+
+
 def main():
-    parser = argparse.ArgumentParser(description='Train Transformer Language Model')
+    parser = argparse.ArgumentParser(description='Train enGramTransformer LM with Muon + AdamW')
     parser.add_argument('--config', type=str, required=True, help='Path to config JSON file')
     parser.add_argument('--resume', type=str, default=None,  help='Path to checkpoint to resume from')
     parser.add_argument('--gradient_accumulation_steps', type=int, default=1,
                         help='Number of gradient accumulation steps to simulate larger batch size')
+    # Muon-specific arguments (can be overridden from config file)
+    parser.add_argument('--muon_lr', type=float, default=None,
+                        help='Learning rate for Muon optimizer (default: from config or 0.02)')
+    parser.add_argument('--muon_momentum', type=float, default=None,
+                        help='Momentum for Muon optimizer (default: from config or 0.95)')
+    parser.add_argument('--muon_ns_steps', type=int, default=None,
+                        help='Newton-Schulz iterations for Muon (default: from config or 5)')
     args = parser.parse_args()
 
     # Load configuration using Config class
     config = Config.from_json(args.config)
+    
+    # Verify Engram is enabled
+    if not config.use_engram:
+        print("WARNING: use_engram is False in config. Setting to True for Engram training.")
+        config.use_engram = True
+    
+    # Print Engram configuration
+    print(f"\n{'='*60}")
+    print("Engram Configuration:")
+    print(f"{'='*60}")
+    print(f"  Engram enabled: {config.use_engram}")
+    print(f"  Engram layer IDs: {config.engram_layer_ids}")
+    print(f"  Max N-gram size: {config.engram_max_ngram_size}")
+    print(f"  Embedding dim per N-gram: {config.engram_n_embed_per_ngram}")
+    print(f"  Heads per N-gram: {config.engram_n_head_per_ngram}")
+    print(f"  Vocab sizes: {config.engram_vocab_size}")
+    print(f"  Kernel size: {config.engram_kernel_size}")
+    print(f"  Hyper-connection multiplicity: {config.hc_mult}")
+    print(f"  Tokenizer path: {config.engram_tokenizer_path}")
+    print(f"{'='*60}\n")
+    
+    # Get Muon parameters from config file or command line (command line takes precedence)
+    muon_lr = args.muon_lr if args.muon_lr is not None else getattr(config, 'muon_lr', 0.02)
+    muon_min_lr = getattr(config, 'muon_min_lr', muon_lr * 0.1)  # Default: 10% of max
+    muon_momentum = args.muon_momentum if args.muon_momentum is not None else getattr(config, 'muon_momentum', 0.95)
+    muon_nesterov = getattr(config, 'muon_nesterov', True)
+    muon_ns_steps = args.muon_ns_steps if args.muon_ns_steps is not None else getattr(config, 'muon_ns_steps', 5)
+    muon_weight_decay = getattr(config, 'muon_weight_decay', 0.0)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
@@ -173,11 +246,18 @@ def main():
     wandb_config = config.to_dict()
     wandb_config['gradient_accumulation_steps'] = args.gradient_accumulation_steps
     wandb_config['effective_batch_size'] = config.batch_size * args.gradient_accumulation_steps
+    wandb_config['optimizer'] = 'Muon+AdamW'
+    wandb_config['muon_lr'] = muon_lr
+    wandb_config['muon_min_lr'] = muon_min_lr
+    wandb_config['muon_momentum'] = muon_momentum
+    wandb_config['muon_nesterov'] = muon_nesterov
+    wandb_config['muon_ns_steps'] = muon_ns_steps
+    wandb_config['muon_weight_decay'] = muon_weight_decay
 
     wandb.init(
         project="Transformer_LLM",
         entity="scut_zeno",
-        name=config.run_name,
+        name=f"{config.run_name}_Engram_Muon",
         config=wandb_config
     )
 
@@ -225,44 +305,75 @@ def main():
 
     # Initialize model with FP32 weights (AMP handles BF16 forward pass)
     model = TransformerLM(config=config, device=device, dtype=torch.float32).to(device)
+    
     # count trainable parameters of the model
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Total parameters: {total_params:,}")
     print(f"Trainable parameters: {trainable_params:,}")
+    
+    # Count and display Engram-specific parameters
+    engram_params = count_engram_parameters(model)
+    print(f"\nEngram Parameter Breakdown:")
+    print(f"  Embedding tables: {engram_params['engram_embedding']:>12,}")
+    print(f"  Projection layers: {engram_params['engram_projection']:>12,}")
+    print(f"  ShortConv layers: {engram_params['engram_conv']:>12,}")
+    print(f"  Norm layers: {engram_params['engram_norm']:>12,}")
+    print(f"  Total Engram: {engram_params['engram_total']:>12,} ({100*engram_params['engram_total']/total_params:.2f}%)")
 
     # Compile the model with torch.compile for better performance
     # - mode="default": Balanced optimization between compilation time and performance
-    # - fullgraph=False: Allow graph breaks for dynamic ops (bincount in MoE, etc.)
+    # - fullgraph=False: Allow graph breaks for dynamic ops (bincount in MoE, hash in Engram, etc.)
     # - dynamic=True: Support dynamic tensor shapes
-    print("Compiling model with torch.compile...")
+    print("\nCompiling model with torch.compile...")
     model = torch.compile(model, mode="default", fullgraph=False, dynamic=True)
     print("Model compiled successfully")
 
-    # Initialize optimizer
-    optimizer = AdamW(
-        model.parameters(),
-        lr=config.max_lr,
-        betas=(config.beta1, config.beta2),
-        eps=config.eps,
-        weight_decay=config.weight_decay,
-        fused=True
+    # Initialize Muon + AdamW optimizer
+    # Access original model for parameter separation (before compile)
+    original_model = model._orig_mod if hasattr(model, '_orig_mod') else model
+    
+    optimizer = MuonAdamWOptimizer(
+        model=original_model,
+        muon_lr=muon_lr,
+        adamw_lr=config.max_lr,
+        muon_momentum=muon_momentum,
+        muon_nesterov=muon_nesterov,
+        muon_ns_steps=muon_ns_steps,
+        muon_weight_decay=muon_weight_decay,
+        adamw_betas=(config.beta1, config.beta2),
+        adamw_eps=config.eps,
+        adamw_weight_decay=config.weight_decay,
+        support_engram=True,  # Enable Engram-aware parameter separation
     )
+    
+    # Store min learning rates for schedule
+    adamw_min_lr = config.min_lr
 
     start_iteration = 0  # initialize training state
 
     if args.resume:
         print(f"Resuming from checkpoint: {args.resume}")
-        start_iteration = load_checkpoint(args.resume, model, optimizer)
+        checkpoint = torch.load(args.resume, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        if 'optimizer_state_dict' in checkpoint:
+            try:
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            except Exception as e:
+                print(f"Warning: Could not load optimizer state: {e}")
+                print("Starting with fresh optimizer state.")
+        start_iteration = checkpoint.get('iteration', 0)
         print(f"Resumed from iteration {start_iteration}")
+
     # config model type
     attention_type = config.attention_type
     use_moe = config.use_moe
     ffn_type = 'MoE' if use_moe else 'FFN'
-    module_config = f"{attention_type}+{ffn_type}"
-    # config ckpt dirtory
+    module_config = f"{attention_type}+{ffn_type}+Engram"
+    
+    # config ckpt directory
     dataset_name = config.dataset
-    checkpoint_folder_name = f"{dataset_name}_{module_config}"
+    checkpoint_folder_name = f"{dataset_name}_{module_config}_Muon"
     checkpoint_dir = Path(config.checkpoint_dir) / checkpoint_folder_name
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
@@ -279,15 +390,43 @@ def main():
 
     # initialize record file with header and config
     with open(record_file_path, 'w') as record_file:
-        record_file.write(f"Training Record for {config.dataset}\n")
+        record_file.write(f"Training Record for {config.dataset} (Engram + Muon + AdamW)\n")
         record_file.write("=" * 80 + "\n")
         record_file.write(f"Model: {config.run_name}\n")
+        record_file.write(f"Optimizer: Muon + AdamW\n")
         record_file.write(f"Started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
         record_file.write(f"Config file: {args.config}\n")
         record_file.write("=" * 80 + "\n\n")
 
+        # Write Engram configuration
+        record_file.write("ENGRAM CONFIGURATION:\n")
+        record_file.write("-" * 80 + "\n")
+        record_file.write(f"Engram enabled: {config.use_engram}\n")
+        record_file.write(f"Engram layer IDs: {config.engram_layer_ids}\n")
+        record_file.write(f"Max N-gram size: {config.engram_max_ngram_size}\n")
+        record_file.write(f"Embedding dim per N-gram: {config.engram_n_embed_per_ngram}\n")
+        record_file.write(f"Heads per N-gram: {config.engram_n_head_per_ngram}\n")
+        record_file.write(f"Vocab sizes: {config.engram_vocab_size}\n")
+        record_file.write(f"Kernel size: {config.engram_kernel_size}\n")
+        record_file.write(f"Hyper-connection multiplicity: {config.hc_mult}\n")
+        record_file.write("-" * 80 + "\n\n")
+
+        # Write Muon configuration
+        record_file.write("MUON CONFIGURATION:\n")
+        record_file.write("-" * 80 + "\n")
+        record_file.write(f"Muon LR (max): {muon_lr}\n")
+        record_file.write(f"Muon LR (min): {muon_min_lr}\n")
+        record_file.write(f"Muon Momentum: {muon_momentum}\n")
+        record_file.write(f"Muon Nesterov: {muon_nesterov}\n")
+        record_file.write(f"Muon NS Steps: {muon_ns_steps}\n")
+        record_file.write(f"Muon Weight Decay: {muon_weight_decay}\n")
+        record_file.write(f"AdamW LR (max): {config.max_lr}\n")
+        record_file.write(f"AdamW LR (min): {adamw_min_lr}\n")
+        record_file.write(f"AdamW Weight Decay: {config.weight_decay}\n")
+        record_file.write("-" * 80 + "\n\n")
+
         # Write full configuration
-        record_file.write("CONFIGURATION:\n")
+        record_file.write("FULL CONFIGURATION:\n")
         record_file.write("-" * 80 + "\n")
         record_file.write(json.dumps(config.to_dict(), indent=2))
         record_file.write("\n" + "-" * 80 + "\n\n")
@@ -295,15 +434,16 @@ def main():
         # Write model architecture summary
         record_file.write("MODEL ARCHITECTURE:\n")
         record_file.write("-" * 80 + "\n")
-        record_file.write(f"ATT Type: [{attention_type}]   MLP Type: [{ffn_type}]\n")
+        record_file.write(f"ATT Type: [{attention_type}]   MLP Type: [{ffn_type}]   Engram: [Enabled]\n")
         record_file.write(f"Total parameters: {total_params:,}\n")
         record_file.write(f"Trainable parameters: {trainable_params:,}\n")
+        record_file.write(f"Engram parameters: {engram_params['engram_total']:,} ({100*engram_params['engram_total']/total_params:.2f}%)\n")
         record_file.write(f"Gradient Accumulation Steps: {gradient_accumulation_steps}\n")
         record_file.write(f"Micro Batch Size: {config.batch_size}\n")
         record_file.write(f"Effective Batch Size: {effective_batch_size}\n")
         record_file.write("-" * 80 + "\n\n")
 
-    print("Starting training...")
+    print("\nStarting training with Engram + Muon + AdamW...")
     print("-" * 60)
 
     # Training loop
@@ -319,55 +459,55 @@ def main():
     for iteration in range(start_iteration, config.max_iterations):
         start_time = time.time()
 
-        # update learning rate
-        lr = cos_learning_rate_schedule_with_warmup(
+        # update learning rate with cosine schedule
+        # Compute separate schedules for Muon and AdamW
+        current_muon_lr = cos_learning_rate_schedule_with_warmup(
             iteration,
-            max_lr=config.max_lr,
-            min_lr=config.min_lr,
+            max_lr=muon_lr,
+            min_lr=muon_min_lr,
             warmup_iter=config.warmup_iterations,
             cos_iter=config.max_iterations
         )
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
+        current_adamw_lr = cos_learning_rate_schedule_with_warmup(
+            iteration,
+            max_lr=config.max_lr,
+            min_lr=adamw_min_lr,
+            warmup_iter=config.warmup_iterations,
+            cos_iter=config.max_iterations
+        )
+        optimizer.set_lr_absolute(current_muon_lr, current_adamw_lr)
 
         # Gradient accumulation: perform multiple forward/backward passes
-        # [OPT] Accumulate tensors on GPU, avoid .item() sync until logging
-        accumulated_loss_tensor = torch.tensor(0.0, device=device)
-        grad_norm_tensor = torch.tensor(0.0, device=device)
-        
+        accumulated_loss = 0.0
         for accum_step in range(gradient_accumulation_steps):
             try:
-                loss_t, grad_norm_t = train(
+                loss, grad_norm = train(
                     model, optimizer, train_loader_iter, config_dict, device,
                     gradient_accumulation_steps=gradient_accumulation_steps,
                     accumulation_step=accum_step
                 )
             except StopIteration:
                 train_loader_iter = iter(train_loader)
-                loss_t, grad_norm_t = train(
+                loss, grad_norm = train(
                     model, optimizer, train_loader_iter, config_dict, device,
                     gradient_accumulation_steps=gradient_accumulation_steps,
                     accumulation_step=accum_step
                 )
-            accumulated_loss_tensor = accumulated_loss_tensor + loss_t
-            grad_norm_tensor = grad_norm_t  # Last step's grad_norm
+            accumulated_loss += loss
 
-        # [OPT] Keep running_loss as tensor on GPU to avoid sync
         # Average loss over accumulation steps
-        avg_accum_loss_tensor = accumulated_loss_tensor / gradient_accumulation_steps
-        running_loss += avg_accum_loss_tensor.item()  # Only sync here, once per iteration
+        avg_accum_loss = accumulated_loss / gradient_accumulation_steps
+        running_loss += avg_accum_loss
 
         step_time = time.time() - start_time
 
-        # Log training metrics - only call .item() when actually logging
+        # Log training metrics
         if (iteration + 1) % config.log_interval == 0:
             avg_loss = running_loss / config.log_interval
             perplexity = np.exp(avg_loss)
-            # [OPT] Only sync grad_norm when logging
-            grad_norm_value = grad_norm_tensor.item()
 
             content = f"Iter {iteration + 1:6d} | Loss: {avg_loss:.4f} | PPL: {perplexity:.2f} | " \
-                      f"LR: {lr:.6f} | Grad Norm: {grad_norm_value:.4f} | Time: {step_time:.3f}s"
+                      f"Muon_LR: {current_muon_lr:.6f} | AdamW_LR: {current_adamw_lr:.6f} | Grad Norm: {grad_norm:.4f} | Time: {step_time:.3f}s"
             print(content)
 
             # Save training content to record file
@@ -377,8 +517,9 @@ def main():
             wandb.log({
                 'train/loss': avg_loss,
                 'train/perplexity': perplexity,
-                'train/learning_rate': lr,
-                'train/grad_norm': grad_norm_value,
+                'train/muon_lr': current_muon_lr,
+                'train/adamw_lr': current_adamw_lr,
+                'train/grad_norm': grad_norm,
                 'train/step_time': step_time
             }, step=iteration + 1)
 
@@ -402,7 +543,12 @@ def main():
 
             # save checkpoint
             checkpoint_path = checkpoint_dir / f"checkpoint_iter_{iteration + 1:06d}.pt"
-            save_checkpoint(model, optimizer, iteration + 1, str(checkpoint_path))
+            # Custom save for Muon + AdamW optimizer
+            torch.save({
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'iteration': iteration + 1,
+            }, checkpoint_path)
             print(f"Saved checkpoint: {checkpoint_path}")
 
             # Save best model
@@ -410,7 +556,11 @@ def main():
                 best_val_loss = val_loss
                 best_val_ppl = val_perplexity
                 best_checkpoint_path = checkpoint_dir / "best_model.pt"
-                save_checkpoint(model, optimizer, iteration + 1, str(best_checkpoint_path))
+                torch.save({
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'iteration': iteration + 1,
+                }, best_checkpoint_path)
                 best_model_content = f"New best model saved: {best_checkpoint_path} (val_loss: {val_loss:.4f}, PPL: {val_perplexity:.2f})"
                 print(best_model_content)
 
@@ -440,7 +590,11 @@ def main():
 
     # Save final checkpoint
     final_checkpoint_path = checkpoint_dir / "final_model.pt"
-    save_checkpoint(model, optimizer, config.max_iterations, str(final_checkpoint_path))
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'iteration': config.max_iterations,
+    }, final_checkpoint_path)
     final_checkpoint_content = f"Final checkpoint saved: {final_checkpoint_path}"
     print(final_checkpoint_content)
 

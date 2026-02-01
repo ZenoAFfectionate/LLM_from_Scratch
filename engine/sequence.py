@@ -1,7 +1,7 @@
 from enum import Enum, auto
 import math
 from itertools import count 
-from sampling_parameters import SamplingParams
+from utils.sampler import SamplingParams
 from copy import copy
 
 

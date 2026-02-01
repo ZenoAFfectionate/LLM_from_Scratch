@@ -354,33 +354,30 @@ The algorithm combines classical momentum-based optimization with a sophisticate
 The Muon update procedure operates in three distinct stages that transform raw gradients into geometrically-constrained parameter updates. First, momentum accumulation applies exponential moving average to gradients with optional Nesterov acceleration, creating a smoothed update direction that incorporates historical gradient information. Second, Newton-Schulz orthogonalization iteratively refines this update to approximate the nearest orthogonal matrix, ensuring the update preserves inner products and norms. Third, adaptive scaling adjusts the update magnitude based on parameter matrix aspect ratio, compensating for the dimension-dependent spectral properties of orthogonal matrices.
 
 ```python
-# Core Muon update computation (model/optimizer/Muon.py:35-58)
+# Core Muon update computation (model/optimizer/Muon.py:38-61)
 def muon_update(grad, momentum, scaling_factor, beta=0.95, ns_steps=5, nesterov=True):
     """
     Compute Muon update with momentum and orthogonalization.
 
     Args:
         grad: Gradient tensor
-        momentum: Momentum buffer (updated in-place via EMA)
-        scaling_factor: Precomputed aspect-ratio-based scaling
+        momentum: Momentum buffer
         beta: Momentum coefficient (default: 0.95)
         ns_steps: Number of Newton-Schulz iterations (default: 5)
         nesterov: Whether to use Nesterov momentum (default: True)
+
+    Returns:
+        Orthogonalized update tensor
     """
-    # Stage 1: Momentum accumulation with EMA
-    momentum.lerp_(grad, 1 - beta)  # momentum ← β·momentum + (1-β)·grad
-
-    # Nesterov lookahead: blend gradient and momentum for update
+    # update momentum with EMA
+    momentum.lerp_(grad, 1 - beta)
+    # Use non-in-place lerp to avoid modifying the gradient tensor
     update = grad.lerp(momentum, beta) if nesterov else momentum
-
-    # Handle convolution filters by flattening spatial dimensions
-    if update.ndim == 4:
+    # for the case of conv filters
+    if update.ndim == 4: 
         update = update.view(len(update), -1)
-
-    # Stage 2: Newton-Schulz orthogonalization
+    # perform Newton-Schulz orthogonalization
     update = newtonschulz5_orthogonalization(update, steps=ns_steps)
-
-    # Stage 3: Apply adaptive scaling
     return update * scaling_factor
 ```
 
@@ -389,30 +386,34 @@ def muon_update(grad, momentum, scaling_factor, beta=0.95, ns_steps=5, nesterov=
 The orthogonalization procedure employs a quintic Newton-Schulz iteration optimized for rapid convergence near the identity matrix. Traditional Newton-Schulz methods use cubic iterations, but our implementation leverages carefully tuned quintic coefficients (a=3.4445, b=-4.7750, c=2.0315) that maximize the derivative at zero, accelerating convergence by approximately 40% compared to standard formulations. The algorithm normalizes the input matrix by its spectral norm to ensure convergence, then iteratively refines the approximation through matrix multiplications that quintically accelerate toward orthogonality.
 
 ```python
-# Newton-Schulz quintic iteration (model/optimizer/Muon.py:9-32)
+# Newton-Schulz quintic iteration (model/optimizer/Muon.py:12-35)
+# define coefficients here:
+a = +3.4445
+b = -4.7750
+c = +2.0315
+
 def newtonschulz5_orthogonalization(G, steps: int):
     """
-    Compute orthogonalization via quintic Newton-Schulz iteration.
-    Coefficients selected to maximize slope at zero for fast convergence.
+    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
+    quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
+    of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
+    zero even beyond the point where the iteration no longer converges all the way to one everywhere
+    on the interval.
     """
-    X = G.to(torch.bfloat16)  # Cast to BF16 for GPU efficiency
+    assert G.ndim >= 2, "Input tensor must be at least 2D"
+    X = G.to(torch.bfloat16)
 
-    # Handle tall matrices via transposition
-    if G.size(-2) > G.size(-1):
-        X = X.mT
+    if G.size(-2) > G.size(-1): X = X.mT  # transpose for tall matrices
 
-    # Normalize spectral norm to ensure convergence
+    # ensure spectral norm is at most 1
     X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
-
-    # Quintic iteration: X ← a·X + (b·A + c·A²)·X where A = X·X^T
+    # perform the NS iterations
     for _ in range(steps):
-        A = X @ X.mT                      # Gram matrix
-        B = b * A + c * A @ A             # Quintic polynomial evaluation
-        X = a * X + B @ X                 # Update step
+        A = X @ X.mT
+        B = b * A + c * A @ A  # quintic computation strategy
+        X = a * X + B @ X
 
-    # Restore original orientation for tall matrices
-    if G.size(-2) > G.size(-1):
-        X = X.mT
+    if G.size(-2) > G.size(-1): X = X.mT  # transpose for tall matrices
 
     return X
 ```
@@ -424,13 +425,18 @@ The quintic formulation provides several advantages over lower-order iterations:
 A critical but often overlooked aspect of orthogonal matrix updates is their dimension-dependent behavior: an m×n orthogonal matrix has spectral norm √(max(m,n)/min(m,n)), meaning updates to tall or wide matrices inherently have larger norms than square matrices. To compensate, Muon applies aspect-ratio-based scaling that normalizes updates to have consistent effective step sizes regardless of parameter shape.
 
 ```python
-# Scaling factor computation during optimizer initialization (Muon.py:104-109)
-if p.ndim >= 2:
-    m, n = p.shape[-2], p.shape[-1]
-    scale_value = max(1.0, m / n) ** 0.5  # √(max(m,n)/min(m,n))
-    state["scaling_factor"] = scale_value
-else:
-    state["scaling_factor"] = 1.0  # No scaling for 1D parameters
+# Scaling factor computation during optimizer initialization (model/optimizer/Muon.py:102-112)
+state = self.state[p]
+if len(state) == 0:
+    # initialize momentum buffer
+    state["momentum_buffer"] = torch.zeros_like(p)
+    # compute and cache scaling factor
+    if p.ndim >= 2:
+        m, n = p.shape[-2], p.shape[-1]
+        scale_value = max(1.0, m / n) ** 0.5
+        state["scaling_factor"] = scale_value
+    else:
+        state["scaling_factor"] = 1.0
 ```
 
 This scaling ensures that the effective learning rate remains consistent across layers with different parameter shapes, preventing the optimizer from taking disproportionately large steps on non-square weight matrices. The square root relationship arises from the spectral norm properties of orthogonal matrices and empirically provides balanced convergence across diverse network architectures.
@@ -440,21 +446,28 @@ This scaling ensures that the effective learning rate remains consistent across 
 Muon is specifically designed for **2D weight matrices** in hidden layers and should not be applied universally to all model parameters. The orthogonalization procedure requires matrix structure to be meaningful—applying it to 1D vectors (biases, normalization scales) provides no benefit and may degrade performance. Our recommended practice separates parameters into two groups: Muon optimizes transformer weight matrices (attention projections, feedforward layers), while AdamW handles embeddings, output layers, and all bias/gain parameters.
 
 ```python
-# Recommended parameter grouping strategy (train.py configuration)
-muon_params = []  # 2D weight matrices
-adam_params = []  # Embeddings, biases, output layers
+# Recommended parameter grouping with MuonAdamWOptimizer (model/optimizer/Muon.py:252-395)
+# The MuonAdamWOptimizer class provides a unified interface for combined optimization
 
-for name, param in model.named_parameters():
-    if param.ndim >= 2 and 'embedding' not in name and 'lm_head' not in name:
-        muon_params.append(param)  # Hidden layer weights → Muon
-    else:
-        adam_params.append(param)  # Other parameters → AdamW
+from model.optimizer.Muon import MuonAdamWOptimizer
 
-# Create optimizer with separate parameter groups
-optimizer = torch.optim.Optimizer([
-    {'params': muon_params, 'optimizer': Muon(lr=0.02, momentum=0.95)},
-    {'params': adam_params, 'optimizer': AdamW(lr=1e-3, betas=(0.9, 0.999))}
-])
+optimizer = MuonAdamWOptimizer(
+    model,
+    muon_lr=0.02,              # Learning rate for Muon (in spectral norm units)
+    adamw_lr=3e-4,             # Learning rate for AdamW
+    muon_momentum=0.95,        # Momentum coefficient for Muon
+    muon_nesterov=True,        # Use Nesterov momentum
+    muon_ns_steps=5,           # Newton-Schulz iterations
+    muon_weight_decay=0.0,     # Weight decay for Muon parameters
+    adamw_betas=(0.9, 0.999),  # Adam beta coefficients
+    adamw_weight_decay=0.1,    # Weight decay for AdamW parameters
+    support_engram=False,      # Set to True for models with Engram modules
+)
+
+# Parameter separation is handled automatically:
+# - Muon: 2D weight matrices (attention projections, FFN layers)
+# - AdamW with decay: embeddings, lm_head, Engram embeddings
+# - AdamW no decay: biases, normalization parameters, 1D params
 ```
 
 **Performance Characteristics:**
@@ -559,7 +572,7 @@ The architecture employs a decoupled design where queries and keys are split int
 
 **Implementation Details:**
 
-Our implementation in `model/attention/MLA.py:34-190` demonstrates this through a carefully orchestrated projection sequence:
+Our implementation in `model/attention/MLA.py:26-146` demonstrates this through a carefully orchestrated projection sequence:
 
 ```python
 # MLA: Low-rank compression with decoupled RoPE (model/attention/MLA.py)
@@ -607,32 +620,47 @@ The fundamental insight behind DSA is that for most queries, only a small subset
 The indexing mechanism operates through a lightweight neural module that compresses queries and keys into a low-dimensional space where similarity can be computed efficiently. The indexer employs several optimizations: FP8 quantization reduces memory bandwidth requirements, Hadamard rotation decorrelates activation patterns for better quantization, and per-block scaling preserves numerical precision despite reduced bit width.
 
 ```python
-# DSA: Efficient token indexing with FP8 quantization (model/attention/DSA.py)
+# DSA: Efficient token indexing with FP8 quantization (model/attention/DSA.py:96-174)
 class Indexer(nn.Module):
-    def forward(self, x, q_compressed, start_pos, mask):
-        # Step 1: Project to indexer dimensions
-        q = self.q_proj(q_compressed)  # (batch, seq_len, head_num * head_dim)
-        k = self.k_norm(self.k_proj(x))  # (batch, seq_len, head_dim)
+    def forward(self, x, q, start_pos, mask, return_scores=False):
+        """Forward pass to compute index scores and select top-k tokens."""
+        batch_size, seq_len, _ = x.shape
+        token_positions = torch.arange(start_pos, start_pos + seq_len, device=x.device)
 
-        # Step 2: Apply RoPE to decoupled components
+        # Step 1: Project query and key
+        q = self.q_proj(q).view(batch_size, seq_len, self.head_num, self.head_dim)
+        k = self.k_norm(self.k_proj(x))
+
+        # Step 2: Split and apply RoPE
         q_rope, q_nope = torch.split(q, [self.d_rope, self.head_dim - self.d_rope], dim=-1)
         k_rope, k_nope = torch.split(k, [self.d_rope, self.head_dim - self.d_rope], dim=-1)
-        # ... RoPE application ...
+        q_rope = self.rope(q_rope.transpose(1, 2), token_positions).transpose(1, 2)
+        k_rope = self.rope(k_rope.unsqueeze(1), token_positions).squeeze(1)
+        # [OPT] Use expand instead of explicit expand - it's a view, no memory copy
+        k_rope_expanded = k_rope.unsqueeze(2).expand(-1, -1, self.head_num, -1)
 
-        # Step 3: Rotate activations using Hadamard transform (decorrelation)
-        q = rotate_activation(q)  # Hadamard rotation for better quantization
-        k = rotate_activation(k)
+        # Step 3: Concatenate and apply Hadamard rotation for better quantization
+        q = torch.cat([q_nope, q_rope], dim=-1)
+        k = torch.cat([k_nope, k_rope_expanded], dim=-1)
+        q = rotate_activation(q.to(torch.bfloat16))
+        k = rotate_activation(k.to(torch.bfloat16))
 
-        # Step 4: Quantize to FP8 with per-block scaling
-        q_fp8, q_scale = act_quant(q, block_size=32, fmt='ue8m0')
-        k_fp8, k_scale = act_quant(k, block_size=32, fmt='ue8m0')
+        # Step 4: FP8 quantization
+        q_fp8, q_scale = act_quant(q, BLOCK_SIZE, self.scale_fmt)
+        k_fp8, k_scale = act_quant(k, BLOCK_SIZE, self.scale_fmt)
 
         # Step 5: Compute aggregation weights and index scores
-        weights = self.w_proj(x) * (self.head_num ** -0.5)  # Per-token importance
-        index_score = fp8_index(q_fp8, weights, k_cache, k_scale)  # Efficient FP8 matmul
+        weights = self.w_proj(x.float()) * self.head_num_inv_sqrt
+        weights = weights.unsqueeze(-1) * q_scale * self.scale
+        k_cache = k_fp8[:, :, 0, :].contiguous()
+        index_score = fp8_index(q_fp8.contiguous(), weights, k_cache, k_scale[:, :, 0, :].contiguous())
 
-        # Step 6: Select top-k relevant tokens
-        return index_score.topk(min(self.index_topk, end_pos), dim=-1)[1]
+        # Step 6: Apply causal mask and select top-k
+        if mask is not None:
+            index_score = index_score.masked_fill(~mask, float('-inf'))
+        topk_indices = index_score.topk(min(self.index_topk, index_score.size(-1)), dim=-1, sorted=False)[1]
+        
+        return (topk_indices, index_score) if return_scores else (topk_indices, None)
 ```
 
 **Sparse Attention Pipeline:**
@@ -640,36 +668,59 @@ class Indexer(nn.Module):
 After the indexer identifies relevant tokens, the full attention mechanism operates only on this sparse subset, dramatically reducing computation while maintaining expressiveness. The implementation creates a boolean mask that enables attention only to selected positions, seamlessly integrating with PyTorch's `scaled_dot_product_attention` for kernel fusion benefits.
 
 ```python
-# DSA forward pass with sparse attention (model/attention/DSA.py:211-290)
-def forward(self, x, start_pos, mask):
-    # Standard low-rank KV compression (similar to MLA)
+# DSA forward pass with sparse attention (model/attention/DSA.py:289-417)
+def forward(self, x, start_pos=0, mask=None, use_sparse=True, return_attention=False):
+    """
+    Forward pass for training mode.
+    
+    Args:
+        x: Input tensor, shape (batch, seq_len, d_model)
+        start_pos: Starting position for RoPE
+        mask: Optional attention mask (True = attend, False = mask)
+        use_sparse: If True, use sparse attention via indexer. If False, use dense attention.
+        return_attention: If True, return attention weights for indexer training
+    """
+    batch, seq_len, _ = x.shape
+    token_positions = torch.arange(start_pos, start_pos + seq_len, device=x.device)
+
+    # Process Q with low-rank compression
     q_compressed = self.q_norm(self.q_down_proj(x))
-    q_nope = self.q_nope_up_proj(q_compressed).view(batch, seq_len, self.head_num, self.head_dim)
-    q_rope = self.q_rope_up_proj(q_compressed).view(batch, seq_len, self.head_num, self.rope_dim)
-    # ... RoPE and concatenation ...
+    q_nope = self.q_nope_up_proj(q_compressed).view(batch, seq_len, self.num_heads, -1)
+    q_rope = self.q_rope_up_proj(q_compressed).view(batch, seq_len, self.num_heads, -1)
+    q_rope = self.rope(q_rope.transpose(1, 2), token_positions).transpose(1, 2)
+    q = torch.cat([q_nope, q_rope], dim=-1).transpose(1, 2)
 
+    # Process K and V with low-rank compression
     kv_compressed = self.kv_norm(self.kv_down_proj(x))
-    k_nope = self.k_up_proj(kv_compressed)
-    v = self.v_up_proj(kv_compressed)
-    # ... expand k_rope and concatenate ...
+    k_rope = self.rope(self.k_rope_proj(x).unsqueeze(1), token_positions).squeeze(1)
+    k_nope = self.k_up_proj(kv_compressed).view(batch, seq_len, self.num_heads, self.head_dim)
+    v = self.v_up_proj(kv_compressed).view(batch, seq_len, self.num_heads, self.head_dim)
+    k_rope = k_rope.unsqueeze(2).expand(batch, seq_len, self.num_heads, self.rope_dim)
+    k = torch.cat([k_nope, k_rope], dim=-1).transpose(1, 2)
+    v = v.transpose(1, 2)
 
-    # Indexing: Select relevant tokens (sparse pattern)
-    topk_indices = self.indexer(x, q_compressed, start_pos, mask)  # (batch, seq_len, index_topk)
+    if use_sparse:
+        # Get indexer outputs for sparse attention
+        topk_indices, _ = self.indexer(x, q_compressed, start_pos, mask, return_scores=True)
 
-    # Create sparse attention mask
-    index_mask = torch.zeros((batch, seq_len, total_seq_len), dtype=torch.bool)
-    index_mask.scatter_(-1, topk_indices, True)  # Allow attention only to selected tokens
+        # Create sparse attention mask from top-k indices
+        index_mask = torch.zeros((batch, seq_len, seq_len), device=x.device, dtype=torch.bool)
+        index_mask = index_mask.scatter_(-1, topk_indices, True)
+        
+        # Combine with causal mask if provided
+        if mask is not None:
+            expanded_mask = torch.zeros((seq_len, seq_len), device=x.device, dtype=torch.bool)
+            expanded_mask[:, :seq_len] = mask
+            index_mask = index_mask & expanded_mask
+        
+        index_mask = index_mask.unsqueeze(1)  # (batch, 1, seq_len, seq_len)
+        attn_output = F.scaled_dot_product_attention(q, k, v, attn_mask=index_mask)
+    else:
+        # Dense attention for comparison/training
+        attn_output = torch.matmul(attn_weights, v)
 
-    # Combine with causal mask if provided
-    if mask is not None:
-        expanded_mask = torch.zeros((seq_len, total_seq_len), dtype=torch.bool)
-        expanded_mask[:, :seq_len] = mask  # Causal constraint within current sequence
-        expanded_mask[:, seq_len:] = True   # Allow cached positions
-        index_mask = index_mask & expanded_mask  # Logical AND
-
-    # Efficient sparse attention
-    attn_output = F.scaled_dot_product_attention(q, k, v, attn_mask=index_mask)
-    return self.output_proj(attn_output.transpose(1, 2).contiguous().view(...))
+    attn_output = attn_output.transpose(1, 2).contiguous().view(batch, seq_len, -1)
+    return self.output_proj(attn_output), attn_weights if return_attention else None
 ```
 
 **FP8 Quantization Strategy:**
@@ -682,7 +733,7 @@ DSA provides substantial benefits across multiple dimensions. The sparse attenti
 
 **Integration with KV Cache:**
 
-Our implementation in `model/attention/DSA.py:196-209` integrates DSA with efficient KV caching similar to MLA, storing compressed representations (`kv_lora_rank`) and separate RoPE components. The indexer maintains its own FP8 cache for keys, enabling rapid similarity computation during autoregressive generation without reprocessing cached tokens at full precision.
+Our implementation in `model/attention/DSA.py` integrates DSA with efficient KV caching similar to MLA, storing compressed representations (`kv_lora_rank`) and separate RoPE components. The `DeepseekSparseAttention` class supports both training mode (with sparse attention via indexer) and inference mode (with paged attention for efficient serving). The `Indexer` class implements FP8-based token selection with optimizations including causal mask caching, pre-computed constants, and efficient expand operations.
 
 **Performance Characteristics:**
 
@@ -698,7 +749,7 @@ This phenomenon becomes particularly pronounced in longer contexts and can limit
 
 **Gating Mechanism Solution:**
 
-To address this limitation while simultaneously enhancing model expressiveness, this project integrates a gating mechanism into all attention variants that introduces non-linearity and learned sparsity beyond what softmax provides. The gate implementation, visible across `MHA.py:44`, `GQA.py:48`, `MLA.py:85`, and `DSA.py:100`, employs per-head learnable scalar parameters `head_gates_logits` stored in FP32 for stability.
+To address this limitation while simultaneously enhancing model expressiveness, this project integrates a gating mechanism into all attention variants that introduces non-linearity and learned sparsity beyond what softmax provides. The gate implementation employs per-head learnable scalar parameters `head_gates_logits` stored in FP32 for stability, applied consistently across all attention variants (MHA, GQA, MLA, DSA).
 
 ```python
 # Gated attention implementation (applied to all attention variants)
@@ -749,37 +800,38 @@ The core challenge in MoE forward passes lies in efficiently routing tokens to t
 The implementation begins by sorting all token-expert assignments by expert ID, transforming the sparse routing problem into a dense computation problem where each expert processes a contiguous chunk of tokens. This sorting operation, while O(N log N) in complexity, proves far more efficient than the O(N × E) boolean masking approach because it enables vectorized operations and eliminates CPU-GPU synchronization points. After sorting, we compute cumulative token offsets using `torch.bincount()` and `torch.cumsum()` to determine the exact memory range each expert should process, completely avoiding `.item()` calls that would force GPU-to-CPU data transfers. Each expert then processes its assigned token chunk in a single forward pass with excellent cache locality, as all input tokens are stored contiguously in memory. Finally, we use `scatter_add_()` to accumulate expert outputs back to their original token positions, naturally handling cases where multiple experts contribute to the same token when `top_k > 1`.
 
 ```python
-# Sort-based MoE forward pass (model/moe.py:273-364)
+# Sort-based MoE forward pass (model/architecture/moe.py:219-270)
 # Step 1: Sort by expert ID to create contiguous chunks
 sorted_expert_idx = torch.argsort(flat_topk_idx)
 sorted_token_idx = token_indices[sorted_expert_idx]
-sorted_weights = flat_topk_weight[sorted_expert_idx]
+sorted_weight = flat_topk_weight[sorted_expert_idx]
 sorted_tokens = x_flat[sorted_token_idx]
 
-# Step 2: Compute token offsets for each expert (NO .item() calls!)
-expert_token_counts = torch.bincount(flat_topk_idx, minlength=self.n_routed_experts)
-token_offsets = torch.cat([
-    torch.tensor([0], device=x_flat.device, dtype=torch.long),
-    torch.cumsum(expert_token_counts, dim=0)
-])
+# Step 2: Reuse expert_token_counts from Gate, convert to list ONCE
+# This is the single sync point - using torch.split avoids cumsum overhead
+expert_counts_list = expert_token_counts.tolist()
 
-# Step 3: Process each expert on its contiguous chunk
-y_sorted = torch.zeros_like(sorted_tokens)
+# Step 3: Split sorted_tokens into chunks by expert (no sync needed)
+expert_inputs = torch.split(sorted_tokens, expert_counts_list)
+
+# Step 4: Process each expert and collect outputs
+expert_outputs = []
 for expert_id in range(self.n_routed_experts):
-    start_idx = token_offsets[expert_id]
-    end_idx = token_offsets[expert_id + 1]
-    if start_idx == end_idx:
-        continue
+    count = expert_counts_list[expert_id]
+    if count == 0:
+        expert_outputs.append(sorted_tokens.new_empty(0, self.d_model))
+    else:
+        expert_outputs.append(self.experts[expert_id](expert_inputs[expert_id]))
 
-    expert_input = sorted_tokens[start_idx:end_idx]
-    expert_output = self.experts[expert_id](expert_input)
-    weights = sorted_weights[start_idx:end_idx].unsqueeze(-1)
-    y_sorted[start_idx:end_idx] = expert_output * weights
+# Concatenate all outputs back together
+y_sorted = torch.cat(expert_outputs, dim=0)
 
-# Step 4: Scatter sorted results back to original positions
-y_flat = torch.zeros(n_total_tokens, self.d_model, device=x_flat.device, dtype=x_flat.dtype)
-sorted_token_idx_expanded = sorted_token_idx.unsqueeze(-1).expand_as(y_sorted)
-y_flat.scatter_add_(0, sorted_token_idx_expanded, y_sorted)
+# Step 5: Fused Triton kernel for scatter-add with weight multiplication
+# Uses segment reduction instead of atomic scatter-add for better performance
+y_flat = fused_scatter_add_weighted(
+    y_sorted, sorted_token_idx, sorted_weight,
+    n_total_tokens, self.num_experts_per_tok
+)
 ```
 
 This architecture delivers substantial performance benefits through multiple synergistic optimizations. The elimination of CPU-GPU synchronization removes the primary bottleneck that plagued earlier implementations, where each `.item()` call would stall the GPU for microseconds while waiting for scalar values. The contiguous memory layout ensures that expert computations benefit from optimal cache utilization and memory coalescing, as modern GPUs achieve peak bandwidth only when accessing sequential memory addresses. Most critically, the fixed tensor shapes throughout the pipeline enable `torch.compile()` to generate a single optimized CUDA graph that executes repeatedly without recompilation overhead, sustaining 85-95% GPU utilization compared to the 10-20% achieved by boolean masking approaches. The sort-based strategy also scales gracefully with increasing expert counts, as the O(N log N) sorting cost remains negligible compared to the O(N × d_model × d_ff) expert computation cost.
@@ -792,37 +844,39 @@ A critical challenge in MoE training is maintaining balanced load distribution a
 The mechanism operates through a simple yet effective bias adjustment strategy where each expert maintains a learnable bias term that is added to routing scores during expert selection but excluded from the gating weights used for output aggregation. This decoupling ensures that bias adjustments affect which experts are selected without distorting the contribution weights, preserving the routing network's ability to learn appropriate expert importance. After each training step, the system compares each expert's actual load against the expected uniform load and adjusts biases accordingly—overloaded experts receive negative bias updates that reduce their selection probability, while underloaded experts receive positive updates that increase their chances of being selected. The bias update magnitude is controlled by a hyperparameter `bias_update_speed` that determines convergence speed, with typical values around 0.01 providing stable dynamics across diverse training scenarios.
 
 ```python
-# Auxiliary-loss-free load balancing in Gate forward pass (model/moe.py:114-150)
+# Auxiliary-loss-free load balancing in Gate forward pass (model/architecture/moe.py:65-107)
 def forward(self, x):
-    # Calculate affinity scores for each expert
+    """ Forward pass with auxiliary-loss-free load balancing """
+    bsz, seq_len, _ = x.shape
+    x_flat = x.view(-1, x.shape[-1])
+    
+    # calculate affinity scores for each expert
     logits = x_flat @ self.weight.t()
     scores = torch.sigmoid(logits)
 
-    # Add bias term to affinity scores for top-k routing (only used for routing)
-    biased_logits = logits + self.expert_bias.to(logits.dtype).unsqueeze(0)
+    # [OPT] Use cached bias conversion to avoid repeated .to() calls
+    if self.expert_bias.dtype == logits.dtype:
+        biased_logits = logits + self.expert_bias.unsqueeze(0)
+    else:
+        biased_logits = logits + self._get_bias_in_dtype(logits.dtype).unsqueeze(0)
 
-    # Select top-k experts based on biased logits but use unbiased weights
-    _, topk_idx = torch.topk(biased_logits, k=self.top_k, dim=-1, sorted=False)
-    topk_weight = torch.gather(scores, dim=-1, index=topk_idx)
-    topk_weight = topk_weight / (topk_weight.sum(dim=-1, keepdim=True) + 1e-10)
+    # select top-k experts based on biased logits and their unbiased weights
+    _, topk_indices = torch.topk(biased_logits, k=self.top_k, dim=-1, sorted=False)
+    topk_weights = torch.gather(scores, dim=-1, index=topk_indices)
+    if self.top_k > 1:  # re-normalize the weights of the selected
+        denominator = topk_weights.sum(dim=-1, keepdim=True) + 1e-10
+        topk_weights = topk_weights / denominator
 
-    # Track expert load using vectorized bincount (NO Python loops!)
+    # [OPT] Use one_hot + sum instead of bincount - faster for small n_routed_experts
+    expert_token_counts = None
     if self.training:
-        self.expert_load = torch.bincount(
-            topk_idx.flatten(),
-            minlength=self.n_routed_experts
-        ).to(dtype=torch.long)
+        expert_token_counts = F.one_hot(
+            topk_indices.flatten(), 
+            num_classes=self.n_routed_experts
+        ).sum(dim=0)
+        self.expert_load = expert_token_counts
 
-    return topk_idx, topk_weight, aux_seq_loss
-
-# Vectorized bias update at training step end (model/moe.py:201-216)
-def update_bias(self, total_tokens):
-    # Calculate expected load per expert (uniform distribution)
-    expected_load = (total_tokens * self.top_k) / self.n_routed_experts
-
-    # Vectorized bias update: compute difference and update all biases at once
-    load_diff = self.expert_load.float() - expected_load
-    self.expert_bias -= torch.sign(load_diff) * self.bias_update_speed
+    return topk_indices, topk_weights, aux_seq_loss, expert_token_counts
 ```
 
 The implementation achieves high efficiency through complete vectorization of all load tracking and bias update operations. The expert load computation uses `torch.bincount()` to count token assignments across all experts in a single GPU operation, eliminating the nested Python loops present in naive implementations that would trigger multiple GPU-CPU synchronizations per forward pass. Similarly, the bias update applies element-wise operations across all experts simultaneously using `torch.sign()` to determine update direction and vectorized subtraction for the actual update, avoiding the need to iterate through experts individually. This vectorized approach not only eliminates synchronization overhead but also enables the load balancing logic to execute in parallel with gradient computation, making the performance impact negligible. Empirical results demonstrate that this auxiliary-loss-free method converges to balanced expert utilization within the first few thousand training steps while maintaining superior task performance compared to auxiliary loss approaches, as the routing network faces no conflicting optimization objectives.
@@ -835,34 +889,38 @@ While the bias-based load balancing effectively addresses global expert utilizat
 The sequence-wise balance loss computes the product of two quantities for each expert: the fraction of tokens in a sequence where the expert appears in the top-K selection, and the average normalized routing probability for that expert across the sequence. This formulation naturally penalizes scenarios where certain experts are both frequently selected and receive high routing scores within a sequence, creating a soft constraint that encourages the routing network to distribute its selections more uniformly. The loss is averaged across all experts and sequences, then weighted by a small hyperparameter `aux_seq_loss_alpha` (typically 0.01) to provide gentle guidance without overwhelming the primary language modeling objective. Importantly, this auxiliary loss complements rather than replaces the bias-based balancing—the bias mechanism handles global load distribution while the sequence-wise loss refines local routing patterns.
 
 ```python
-# Sequence-wise balance loss computation (model/moe.py:152-199)
+# Sequence-wise balance loss computation (model/architecture/moe.py:109-143)
 def _compute_sequence_balance_loss(self, scores, topk_idx, bsz, seq_len):
     """
-    Compute sequence-wise balance loss: L_Bal = α * Σ(f_i * P_i)
+    Compute sequence-wise balance loss as described in DeepSeek-V3.
+    Fully vectorized implementation - no Python loops, no GPU-CPU sync
+
+    The loss encourages balanced expert load within each sequence:
+    L_Bal = α * Σ(f_i * P_i)
 
     where:
-    - f_i: fraction of tokens in sequence where expert i is in top-K
-    - P_i: average of normalized routing probabilities for expert i
+    - f_i: fraction of tokens in sequence where expert i is in top-K (eq. 18)
+    - P_i: average of normalized routing probabilities for expert i (eq. 19-20)
+    - α: small hyperparameter weight (seq_alpha)
     """
     scores_reshaped = scores.view(bsz, seq_len, self.n_routed_experts)
     topk_idx_reshaped = topk_idx.view(bsz, seq_len, self.top_k)
 
-    # [OPT] Use F.one_hot instead of scatter_ for better memory efficiency
-    import torch.nn.functional as F
+    # Use F.one_hot - output is already float when scores is float
     expert_mask = F.one_hot(
         topk_idx_reshaped.view(bsz, -1),
         num_classes=self.n_routed_experts
-    ).to(scores.dtype)
+    )  # (bsz, seq_len*top_k, n_experts), dtype=int64
 
-    # Compute f_i: fraction of tokens where expert i is selected
-    f_i = expert_mask.sum(dim=1) / (self.top_k * seq_len)  # (bsz, n_experts)
+    # Compute f_i directly with int64 sum, then convert to float at the end
+    expert_counts = expert_mask.sum(dim=1)  # (bsz, n_experts)
+    f_i = expert_counts.to(scores.dtype) / (self.top_k * seq_len)
 
     # [OPT] Vectorized P_i calculation
     score_sums = scores_reshaped.sum(dim=2, keepdim=True)       # (bsz, seq_len, 1)
     normalized_scores = scores_reshaped / (score_sums + 1e-10)  # (bsz, seq_len, n_experts)
     P_i = normalized_scores.mean(dim=1)                         # (bsz, n_experts)
 
-    # Compute loss: sum over experts, average over batch
     seq_losses = (f_i * P_i).sum(dim=1)  # (bsz,)
     aux_seq_loss = self.seq_alpha * seq_losses.mean()
 
@@ -1009,16 +1067,16 @@ Multi-Head Hashing implements the core retrieval mechanism that maps token histo
 Before hashing, the system constructs N-gram suffixes by extracting sliding windows of canonical token IDs from the compressed input sequence. For a token at position t with N-gram order n, the suffix is defined as g_{t,n} = (x'_{t-n+1}, ..., x'_t), where x'_i denotes the canonical token ID at position i. The implementation creates these suffixes efficiently through NumPy array slicing with precomputed shifts, implemented in `model/architecture/enGram.py:127-135`:
 
 ```python
-# N-gram suffix construction via shifted views (enGram.py:127-135)
+# N-gram suffix construction via shifted views (model/architecture/enGram.py:131-140)
 def shift_k(k: int) -> np.ndarray:
-    """Create shifted views of input for N-gram creation"""
-    if k == 0: return x  # Current token
-    # Pad with canonical pad_id and truncate to original length
+    ''' create shifted views of the input for N-gram creation '''
+    if k == 0:
+        return x
     shifted = np.pad(x, ((0, 0), (k, 0)),
                      mode='constant', constant_values=self.pad_id)[:, :T]
     return shifted
 
-# Precompute all shifted tokens for efficiency
+# precompute all shifted tokens of the input sequence
 base_shifts = [shift_k(k) for k in range(self.max_ngram_size)]
 
 # Extract relevant history for N-gram order n
@@ -1173,32 +1231,37 @@ This deterministic randomization ensures that the same N-gram suffix maps to dif
 After computing hash indices, the system retrieves embeddings through a unified lookup operation that accesses all hash heads simultaneously. Rather than using separate `nn.Embedding` layers for each head (which would require multiple kernel launches), the implementation packs all embedding tables into a single large table and uses index offsetting for efficient access, implemented in `enGram.py:170-199`:
 
 ```python
-# Unified multi-head embedding table (enGram.py:170-199)
+# Unified multi-head embedding table (model/architecture/enGram.py:176-206)
 class MultiHeadEmbedding(nn.Module):
     """
-    Implements multiple independent embedding tables efficiently by packing them
-    into a single large nn.Embedding layer.
+    This class implements multiple independent embedding tables efficiently by packing them 
+    into a single, large physical `nn.Embedding` layer.
 
-    Instead of using nn.ModuleList of K separate embedding layers (requiring K
-    kernel launches), we use one giant table and manage access via index offsetting.
+    Instead of using a `nn.ModuleList` of K separate embedding layers (which would require K 
+    separate kernel launches), we use one giant table and manage access via index offsetting.
+
+    This is crucial for the "Multi-Head Hashing" mechanism in Engram, ensuring high 
+    GPU throughput (O(1) lookup).
     """
+
     def __init__(self, list_of_N: List[int], D: int):
         super().__init__()
         self.num_heads = len(list_of_N)
         self.embedding_dim = D
-        # Calculate prefix sum of sizes to get offsets
+        # calculate prefix sum of the sizes to get offsets and register
         offsets = [0]
         for n in list_of_N[:-1]:
             offsets.append(offsets[-1] + n)
-        self.register_buffer("offsets", torch.tensor(offsets, dtype=torch.long))
-        # Calculate total size and initialize single embedding table
+        self.register_buffer(
+            "offsets", torch.tensor(offsets, dtype=torch.long))
+        # calculate the total size and initalize a single embedding table
         total_N = sum(list_of_N)
         self.embedding = nn.Embedding(num_embeddings=total_N, embedding_dim=D)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        # Add offsets for head i to every token in batch
+        # add offsets for head i to every token in the batch
         shifted_input_ids = input_ids + self.offsets
-        # Perform single efficient lookup operation
+        # perform a single efficient lookup operation
         return self.embedding(shifted_input_ids)
 ```
 
@@ -1225,35 +1288,38 @@ Context-Aware Gating implements the final integration stage where retrieved N-gr
 The gating mechanism operates through a learned similarity computation between normalized hidden states (queries) and normalized memory projections (keys), followed by a specialized activation function that produces bounded gate values in (0, 1). The implementation supports **hyper-connectivity** where each token position maintains H_c independent hidden state channels, each gated separately to enable specialized memory integration paths. The architecture is implemented in `enGram.py:256-282`:
 
 ```python
-# Context-aware gating computation (enGram.py:256-282)
+# Context-aware gating computation (model/architecture/enGram.py:269-300)
 def forward(self, hidden_states, input_ids):
-    # Retrieve hash indices and lookup embeddings
-    hash_input_ids = torch.from_numpy(self.hash_mapping.hash(input_ids)[self.layer_id])
-    embeddings = self.multi_head_embedding(hash_input_ids).flatten(start_dim=-2)
+    # retrieve hash indices for current layer and convert to tensor
+    hash_input_ids = torch.from_numpy(
+        self.hash_mapping.hash(input_ids)[self.layer_id])
+    # move to the same device as the model
+    hash_input_ids = hash_input_ids.to(hidden_states.device)
+    # lookup embeddings and flatten across n-gram heads
+    embeddings = self.multi_head_embedding(
+        hash_input_ids).flatten(start_dim=-2)
 
-    # Compute gates for each hyper-connection
+    # compute gates for each hyper-connection
     gates = []
     for hc_idx in range(self.hc_mult):
-        # Project and normalize retrieved memory (key)
+        # project and normalize retrieved memory
         key = self.key_projs[hc_idx](embeddings)
         normed_key = self.norm1[hc_idx](key)
-
-        # Extract and normalize backbone states (query)
+        # extract and normalize backbone states
         query = hidden_states[:, :, hc_idx, :]
         normed_query = self.norm2[hc_idx](query)
-
-        # Compute gate score via dot product similarity
-        gate = (normed_key * normed_query).sum(dim=-1) / math.sqrt(self.hidden_size)
-
-        # Activation with stabilized sqrt-sigmoid
+        # compute gate score
+        gate = (normed_key * normed_query).sum(dim=-1) / \
+            math.sqrt(self.hidden_size)
+        # activation with stabilized sqrt-sigmoid
         gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
         gate = gate.sigmoid().unsqueeze(-1)
         gates.append(gate)
 
     gates = torch.stack(gates, dim=2)
-    # Apply gates to retrieved value projections
+    # apply gates to retrieved value projections
     value = gates * self.value_proj(embeddings).unsqueeze(2)
-    # Perform short convolution and return
+    # perform short convolution and return
     return value + self.short_conv(value)
 ```
 
@@ -1570,40 +1636,68 @@ class RMSNorm(nn.Module):
 
 This optimization propagates throughout the entire Transformer architecture. Each Transformer block contains two normalization points (attention and feed-forward), and the fused residual pattern threads through all layers, enabling continuous optimization across the entire forward pass.
 
-**Integration in Transformer Block:**
+**Integration in Transformer Block (`model/transformer.py:93-126`):**
 ```python
-class Block(nn.Module):
-    def forward(self, x: torch.Tensor, residual: torch.Tensor, start_pos: int = 0, mask: torch.Tensor = None):
-        # Fused Add & Norm for Attention sublayer
-        if residual is None:
-            x, residual = self.att_norm(x), x
-        else:
-            x, residual = self.att_norm(x, residual)  # Single fused operation
+def forward(self, x: torch.Tensor, residual: torch.Tensor, start_pos: int = 0,
+            mask: torch.Tensor = None) -> torch.Tensor:
+    """
+    Forward pass with Fused Add & Norm optimization.
+
+    Args:
+        x: input tensor
+        residual: residual tensor from previous layer (or None for first layer)
+        start_pos: starting position for RoPE and KV cache
+        mask: optional causal attention mask (shared across all layers)
+
+    Returns:
+        - output tensor
+        - updated residual tensor
+    """
+    # Fused Add & Norm for ATTA
+    if residual is None:
+        x, residual = self.att_norm(x), x
+    else:
+        x, residual = self.att_norm(x, residual)
+    
+    # Handle DSA's tuple return (output, attn_weights)
+    if self.attention_type == "DSA":
+        x, _ = self.att(x, start_pos, mask, use_sparse=True)
+    else:
         x = self.att(x, start_pos, mask)
-        x = self.dropout(x)
+    x = self.dropout(x)
 
-        # Fused Add & Norm for FFN sublayer
-        x, residual = self.ffn_norm(x, residual)      # Single fused operation
-        x = self.ffn(x)
-        x = self.dropout(x)
+    # Fused Add & Norm for FFN
+    x, residual = self.ffn_norm(x, residual)
+    x = self.ffn(x)
+    x = self.dropout(x)
 
-        return x, residual
+    return x, residual
 ```
 
-**Model-Level Coordination:**
+**Model-Level Coordination (`model/transformer.py:170-191`):**
 ```python
-class TransformerLM(nn.Module):
-    def forward(self, x: torch.Tensor, start_pos: int = 0):
-        x = self.token_embeddings(x)
+def forward(self, x: torch.Tensor, start_pos: int = 0):
+    """
+    Forward pass through the transformer language model with Fused Add & Norm.
 
-        # Thread residual stream through all layers
-        residual = None
-        for block in self.layers:
-            x, residual = block(x, residual, start_pos, mask)
+    The causal attention mask is constructed once here and shared across all layers
+    for efficiency. This avoids redundant mask construction in each attention layer.
+    The residual connection is fused with normalization for memory efficiency.
+    """
+    seq_len = x.size(1)
 
-        # Final fused normalization before output head
-        x, _ = self.final_norm(x, residual)
-        return self.lm_head(x)
+    x = self.token_embeddings(x)  # apply token embedding
+
+    mask = None
+    if seq_len > 1:  # construct boolean causal mask once for training (True means allowed)
+        mask = torch.tril(torch.ones((seq_len, seq_len), device=x.device, dtype=torch.bool))
+
+    residual = None
+    for block in self.layers:
+        x, residual = block(x, residual, start_pos, mask)
+
+    x, _ = self.final_norm(x, residual)
+    return self.lm_head(x)  # model token probability distribution
 ```
 
 The cumulative impact is substantial: for a 12-layer Transformer with two normalization points per block, this eliminates 24 separate residual addition operations per forward pass. Profiling reveals approximately 8-12% reduction in forward pass latency compared to the unfused baseline, with benefits scaling proportionally to model depth and becoming particularly pronounced during training where backward passes also leverage the fused operations for gradient computation.
@@ -1846,7 +1940,7 @@ timing_categories = {
     'Optimizer Step': ['optimizer_step'],
     'MoE Bias Update': ['moe_bias_update'],
     'Attention': ['scaled_dot_product_attention', 'matmul', 'bmm'],
-    'MoE Operations': ['gather', 'scatter', 'topk', 'bincount'],
+    'MoE Operations': ['gather', 'scatter', 'topk', 'one_hot'],
     'Normalization': ['rms_norm', 'layer_norm'],
 }
 ```
@@ -2005,16 +2099,21 @@ The expert load tracking mechanism suffers from a fundamental architectural flaw
 
 The solution eliminates all CPU-GPU synchronization by replacing the sequential loop with a single vectorized operation that remains entirely on the GPU. PyTorch's `torch.bincount()` function provides exactly the semantics we need: it counts the occurrences of each integer value in a tensor, producing a histogram in a single parallel operation. By flattening the `topk_idx` tensor and passing it to `bincount()` with `minlength=n_routed_experts`, we obtain a tensor containing the load for all experts simultaneously. This transformation is mathematically equivalent to the original loop—both produce the same count for each expert—but the performance characteristics are radically different. The vectorized approach launches a single optimized CUDA kernel that processes all experts in parallel, leveraging the GPU's thousands of cores to perform counting operations concurrently. Critically, the result remains as a GPU tensor without any `.item()` calls or transfers to CPU memory, preserving the asynchronous execution pipeline. The expert loads are only needed later for bias updates, which also execute on the GPU, so there is no requirement for CPU access at this stage. This design adheres to the fundamental principle of GPU programming: keep data on the device, minimize synchronization, and maximize parallelism.
 
-**Optimized Code (`model/moe.py:137-141`):**
+**Optimized Code (`model/architecture/moe.py:89-97`):**
 
 ```python
-# [OPT] Track expert load using vectorized bincount (NO Python loops, NO CPU-GPU sync)
+# [OPT] Use one_hot + sum instead of bincount - faster for small n_routed_experts
+expert_token_counts = None
 if self.training:
-    self.expert_load = torch.bincount(
-        topk_idx.flatten(),
-        minlength=self.n_routed_experts
-    ).to(dtype=torch.long)
+    # one_hot creates (N, n_experts) then sum along dim=0 gives counts per expert
+    expert_token_counts = F.one_hot(
+        topk_indices.flatten(), 
+        num_classes=self.n_routed_experts
+    ).sum(dim=0)
+    self.expert_load = expert_token_counts
 ```
+
+Note: We use `F.one_hot().sum()` instead of `torch.bincount()` because empirical testing shows it's faster for small numbers of experts (typically 4-16 in most MoE configurations). The one-hot encoding naturally generates a dense tensor that sums efficiently along the batch dimension.
 
 **Performance Impact:**
 
@@ -2060,36 +2159,40 @@ The sequence-wise auxiliary loss computation represents one of the most egregiou
 
 The optimization strategy transforms the nested sequential loops into a fully vectorized computation that processes all batch-expert combinations simultaneously on the GPU. The key insight is recognizing that the mathematical operations within the loops—computing expert selection frequencies and averaged routing probabilities—can be expressed as parallel tensor operations using broadcasting and reduction semantics. We employ `torch.nn.functional.one_hot()` to convert the expert selection indices into a dense boolean mask in a single operation, avoiding the need for iterative boolean comparisons. This one-hot encoding naturally creates a 3D tensor with dimensions `(batch, seq_len × top_k, num_experts)`, where each element indicates whether a particular expert was selected for a given token position. Computing `f_i` (the fraction of tokens where expert i appears in the top-K selection) reduces to a simple sum operation along the token dimension followed by division—both of which execute in parallel across all experts and batch elements simultaneously. For `P_i` (the average normalized routing probability), we leverage broadcasting to compute score normalization across all experts at once: dividing the score tensor by per-token sums produces normalized probabilities for all positions and experts in a single operation, then averaging along the sequence dimension yields the desired per-expert averages. The element-wise product `f_i * P_i` and subsequent averaging across batches and experts complete the loss computation entirely through tensor operations without any scalar extractions. Critically, every intermediate result remains as a GPU tensor, and all operations utilize PyTorch's highly optimized CUDA kernels that fully exploit parallelism. The transformation maintains mathematical equivalence to the original implementation while fundamentally changing the execution model from sequential scalar processing to parallel vectorized computation.
 
-**Optimized Code (`model/moe.py:152-199`):**
+**Optimized Code (`model/architecture/moe.py:109-143`):**
 
 ```python
 def _compute_sequence_balance_loss(self, scores, topk_idx, bsz, seq_len):
     """
-    Compute sequence-wise balance loss: L_Bal = α * Σ(f_i * P_i)
+    Compute sequence-wise balance loss as described in DeepSeek-V3.
+    Fully vectorized implementation - no Python loops, no GPU-CPU sync
 
-    OPTIMIZED: Fully vectorized implementation - no Python loops, no GPU-CPU sync
+    The loss encourages balanced expert load within each sequence:
+    L_Bal = α * Σ(f_i * P_i)
+
+    where:
+    - f_i: fraction of tokens in sequence where expert i is in top-K (eq. 18)
+    - P_i: average of normalized routing probabilities for expert i (eq. 19-20)
+    - α: small hyperparameter weight (seq_alpha)
     """
-    scores_reshaped = scores.view(bsz, seq_len, self.n_routed_experts)
-    topk_idx_reshaped = topk_idx.view(bsz, seq_len, self.top_k)
+    scores_reshaped = scores.view(bsz, seq_len, self.n_routed_experts)  # (bsz, seq_len, n_experts)
+    topk_idx_reshaped = topk_idx.view(bsz, seq_len, self.top_k)         # (bsz, seq_len, top_k)
 
-    # [OPT] Use F.one_hot instead of scatter_ for better memory efficiency
-    import torch.nn.functional as F
+    # Use F.one_hot - output is already float when scores is float
     expert_mask = F.one_hot(
-        topk_idx_reshaped.view(bsz, -1),
+        topk_idx_reshaped.view(bsz, -1),  # (bsz, seq_len*top_k)
         num_classes=self.n_routed_experts
-    ).to(scores.dtype)  # Shape: (bsz, seq_len * top_k, n_experts)
+    )  # (bsz, seq_len*top_k, n_experts), dtype=int64
 
-    # Compute f_i: fraction of tokens where expert i is selected
-    # Sum across tokens, normalize by (top_k * seq_len)
-    f_i = expert_mask.sum(dim=1) / (self.top_k * seq_len)  # (bsz, n_experts)
+    # Compute f_i directly with int64 sum, then convert to float at the end
+    expert_counts = expert_mask.sum(dim=1)  # (bsz, n_experts)
+    f_i = expert_counts.to(scores.dtype) / (self.top_k * seq_len)  # (bsz, n_experts)
 
-    # [OPT] Vectorized P_i calculation
-    # Normalize scores by their per-token sum across all experts
-    score_sums = scores_reshaped.sum(dim=2, keepdim=True)  # (bsz, seq_len, 1)
+    # vectorized P_i calculation: (bsz, n_experts):
+    score_sums = scores_reshaped.sum(dim=2, keepdim=True)       # (bsz, seq_len, 1)
     normalized_scores = scores_reshaped / (score_sums + 1e-10)  # (bsz, seq_len, n_experts)
     P_i = normalized_scores.mean(dim=1)  # (bsz, n_experts)
 
-    # Compute loss: element-wise product, sum over experts, average over batch
     seq_losses = (f_i * P_i).sum(dim=1)  # (bsz,)
     aux_seq_loss = self.seq_alpha * seq_losses.mean()
 
@@ -2133,12 +2236,12 @@ The bias update mechanism embodies another critical synchronization bottleneck t
 
 The optimization eliminates all synchronization by reformulating the bias update as a pure tensor operation that executes entirely on the GPU. The key mathematical insight is recognizing that the conditional bias adjustment can be expressed using the sign function: for each expert, we want to decrease bias if `actual_load > expected_load` (equivalent to `actual_load - expected_load > 0`) and increase bias otherwise. The `torch.sign()` function captures exactly this logic, returning +1 for positive load differences, -1 for negative differences, and 0 for perfectly balanced loads. By computing the load difference vector as `self.expert_load.float() - expected_load`, we obtain a tensor containing the signed deviation for all experts simultaneously. Applying `torch.sign()` produces the update direction vector, and multiplying by `bias_update_speed` yields the adjustment magnitude. The final bias update becomes a single vectorized subtraction: `self.expert_bias -= torch.sign(load_diff) * self.bias_update_speed`, which processes all experts in parallel without any CPU involvement. This formulation is mathematically equivalent to the original conditional logic—each expert's bias changes by exactly the same amount and in the same direction—but the execution model is fundamentally transformed from sequential scalar processing to parallel vector arithmetic. The entire operation remains on the GPU, preserving the asynchronous execution pipeline and allowing subsequent operations to begin immediately without waiting for bias updates to complete. The code also becomes more concise and declarative, expressing the mathematical intent directly rather than through procedural control flow.
 
-**Optimized Code (`model/moe.py:201-216`):**
+**Optimized Code (`model/architecture/moe.py:145-163`):**
 
 ```python
 def update_bias(self, total_tokens):
     """
-    Update expert bias based on load balance.
+    Update expert bias vectorized based on load balance.
     Should be called at the end of each training step.
 
     Args:
@@ -2146,14 +2249,32 @@ def update_bias(self, total_tokens):
     """
     if not self.training:
         return
-
-    # Calculate expected load per expert (uniform distribution)
+    # calculate expected load per expert (uniform distribution)
     expected_load = (total_tokens * self.top_k) / self.n_routed_experts
-
-    # [OPT] Vectorized bias update: compute difference and update all biases at once
-    # NO .item() calls, NO Python loops - pure tensor operation
+    # vectorized bias update: compute difference and update all biases at once
     load_diff = self.expert_load.float() - expected_load
     self.expert_bias -= torch.sign(load_diff) * self.bias_update_speed
+    
+    # [OPT] Invalidate cached bias since we just updated it
+    self._cached_bias_dtype = None
+    self._cached_bias = None
+```
+
+**Additional Optimization: Expert Bias Caching**
+
+The Gate class now includes a caching mechanism to avoid repeated dtype conversions of expert bias during forward passes. The bias is kept in FP32 for precision during updates, but a cached converted version is maintained to avoid per-forward dtype conversion:
+
+```python
+def _get_bias_in_dtype(self, target_dtype: torch.dtype) -> torch.Tensor:
+    """Get expert_bias in the target dtype, using cache to avoid repeated conversions.
+    
+    [OPT] During training, bias changes after each step via update_bias().
+    During inference, bias is constant. The cache avoids repeated .to() calls.
+    """
+    if self._cached_bias_dtype != target_dtype or self._cached_bias is None:
+        self._cached_bias = self.expert_bias.to(target_dtype)
+        self._cached_bias_dtype = target_dtype
+    return self._cached_bias
 ```
 
 **Performance Impact:**
@@ -2198,57 +2319,65 @@ The mask-based expert routing represents the most severe architectural bottlenec
 
 The optimization employs a sort-based routing strategy that fundamentally transforms the MoE forward pass from a scattered, synchronization-heavy operation into a streamlined, cache-friendly pipeline that executes entirely on the GPU with fixed tensor shapes. The core insight is that by sorting all token-expert assignments by expert ID before processing, we can convert the routing problem into a series of contiguous memory operations that maximize cache utilization and eliminate synchronization. The algorithm proceeds in four stages: First, `torch.argsort(flat_topk_idx)` sorts the expert assignments in O(N log N) time—while this is technically higher complexity than the O(N) mask comparison, the GPU's highly optimized parallel sorting kernels execute this operation in approximately 0.5ms, far faster than the 8.8ms of synchronization overhead in the original approach. The sorting creates a permutation that groups all tokens assigned to Expert 0, then all tokens for Expert 1, and so on, establishing contiguous memory regions for each expert. Second, `torch.bincount()` counts tokens per expert and `torch.cumsum()` computes the start/end offsets for each expert's chunk—both vectorized GPU operations that avoid any CPU involvement. Third, for each expert, we slice the sorted token tensor using these precomputed offsets: `sorted_tokens[start_idx:end_idx]` retrieves a contiguous memory block containing all tokens for that expert. This sequential access pattern achieves near-optimal cache performance with L1 hit rates exceeding 90%, compared to the 20% achieved by random gathering. Fourth, after all experts process their contiguous chunks, `scatter_add_()` accumulates results back to original token positions, naturally handling the case where multiple experts contribute to the same token (when top_k > 1). Critically, every tensor in this pipeline maintains fixed shapes determined solely by the total number of token assignments—whether an expert processes 50 or 200 tokens, the overall tensor dimensions remain constant, allowing `torch.compile()` to generate a single optimized CUDA graph that executes repeatedly without recompilation.
 
-**Optimized Code (`model/moe.py:273-364`):**
+**Optimized Code (`model/architecture/moe.py:219-270`):**
 
 ```python
 # ===================================================================
-# OPTIMIZED: Sort-based approach for training
+# OPTIMIZED: Sort-based approach for training with torch.split()
 # ===================================================================
 n_total_tokens = batch_size * seq_len
 flat_topk_weight = topk_weight.view(-1)
 
-# Create token indices for each expert selection
+# create token indices for each expert selection to represents
+# which original token each selection belongs to (batch*seq*top_k,)
 token_indices = torch.arange(
     n_total_tokens, device=x_flat.device
 ).repeat_interleave(self.num_experts_per_tok)
 
-# Step 1: Sort by expert ID to create contiguous chunks
-sorted_expert_idx = torch.argsort(flat_topk_idx)  # O(N log N)
+# sort by expert index to create contiguous chunks: O(N log N)
+# this will groups all tokens for Expert 0, then Expert 1, etc.
+sorted_expert_idx = torch.argsort(flat_topk_idx)
 sorted_token_idx = token_indices[sorted_expert_idx]
-sorted_weights = flat_topk_weight[sorted_expert_idx]
-sorted_tokens = x_flat[sorted_token_idx]  # Permute for contiguous access
+sorted_weight = flat_topk_weight[sorted_expert_idx]
 
-# Step 2: Compute token offsets for each expert (NO .item() calls!)
-expert_token_counts = torch.bincount(flat_topk_idx, minlength=self.n_routed_experts)
-token_offsets = torch.cat([
-    torch.tensor([0], device=x_flat.device, dtype=torch.long),
-    torch.cumsum(expert_token_counts, dim=0)
-])
+# permute tokens to match expert group for contiguous memory access
+sorted_tokens = x_flat[sorted_token_idx]
 
-# Allocate output buffer
-y_sorted = torch.zeros_like(sorted_tokens)
+# Reuse expert_token_counts from Gate - single sync point here
+# Convert counts to list ONCE for torch.split and loop bounds
+expert_counts_list = expert_token_counts.tolist()
 
-# Step 3: Process each expert on its contiguous chunk
+# Split sorted_tokens into chunks by expert (no additional sync needed)
+# torch.split returns a tuple of tensors, one per expert
+expert_inputs = torch.split(sorted_tokens, expert_counts_list)
+
+# Process each expert and collect outputs
+expert_outputs = []
 for expert_id in range(self.n_routed_experts):
-    start_idx = token_offsets[expert_id]
-    end_idx = token_offsets[expert_id + 1]
+    count = expert_counts_list[expert_id]
+    if count == 0:
+        # Empty tensor for experts with no tokens
+        expert_outputs.append(sorted_tokens.new_empty(0, self.d_model))
+    else:
+        expert_outputs.append(self.experts[expert_id](expert_inputs[expert_id]))
 
-    if start_idx == end_idx:  # ✅ Integer comparison (no sync!)
-        continue
+# Concatenate all outputs back together (same order as sorted_tokens)
+y_sorted = torch.cat(expert_outputs, dim=0)
 
-    # Contiguous slice - excellent cache locality!
-    expert_input = sorted_tokens[start_idx:end_idx]
-    expert_output = self.experts[expert_id](expert_input)
-
-    # Apply weights
-    weights = sorted_weights[start_idx:end_idx].unsqueeze(-1)
-    y_sorted[start_idx:end_idx] = expert_output * weights
-
-# Step 4: Scatter sorted results back to original positions
-y_flat = torch.zeros(n_total_tokens, self.d_model, device=x_flat.device, dtype=x_flat.dtype)
-sorted_token_idx_expanded = sorted_token_idx.unsqueeze(-1).expand_as(y_sorted)
-y_flat.scatter_add_(0, sorted_token_idx_expanded, y_sorted)
+# Fused Triton kernel: weight multiplication + scatter-add using segment reduction
+y_flat = fused_scatter_add_weighted(
+    y_sorted,           # raw expert outputs
+    sorted_token_idx,   # target token indices
+    sorted_weight,      # routing weights
+    n_total_tokens,     # number of original tokens
+    self.num_experts_per_tok  # top_k for segment loop unrolling
+)
 ```
+
+The key optimization in the current implementation is using `torch.split()` with a pre-computed counts list instead of manual slicing with cumsum offsets. This approach:
+1. Avoids repeated indexing operations in the loop
+2. Returns views into the original tensor (no memory allocation) when possible
+3. Works seamlessly with `torch.compile()` for graph optimization
 
 **Performance Impact:**
 
@@ -2275,19 +2404,25 @@ The final stage of MoE forward pass requires aggregating expert outputs back to 
 
 The optimization replaces atomic scatter-add with a custom Triton kernel implementing **segment reduction**—a fundamentally different algorithmic approach that eliminates atomic operations entirely. The key insight is that by re-sorting expert outputs by their *target* token index (rather than by expert ID), contributions to each output token become contiguous in memory, forming "segments" that can be summed without any write conflicts. The algorithm proceeds in three stages: First, `torch.argsort(sorted_token_idx)` re-sorts all expert outputs by target position, grouping together all contributions destined for the same output token. Second, `torch.searchsorted()` computes segment boundaries in CSR (Compressed Sparse Row) format, efficiently identifying where each output token's segment begins and ends. Third, a custom Triton kernel processes one output token per thread block: each block loads its segment's contributions (guaranteed to be contiguous), multiplies by routing weights, accumulates the weighted sum in fast shared memory using FP32 precision for numerical stability, and writes the final result to the output tensor. This design achieves several critical advantages: reads are fully coalesced since each segment is contiguous in memory; writes are perfectly coalesced since each thread block writes exactly one output row; no atomic operations are needed since each output position is owned exclusively by one thread block; and the small loop over segment elements (at most top_k iterations) can be fully unrolled by the compiler. The Triton JIT compiler further optimizes the kernel by automatically selecting optimal block sizes, fusing memory operations, and leveraging tensor cores where applicable.
 
-**Optimized Code (`model/architecture/moe_kernels.py`):**
+**Optimized Code (`model/architecture/kernels.py`):**
 
 ```python
 @triton.jit
 def _segment_reduce_weighted_kernel(
+    # Input pointers
     expert_output_ptr,      # (num_sorted, d_model) - expert outputs sorted by target token
     sorted_weights_ptr,     # (num_sorted,) - weights sorted by target token
     segment_offsets_ptr,    # (num_tokens + 1,) - CSR-style offsets for each token's segment
+    # Output pointer
     y_flat_ptr,             # (num_tokens, d_model) - output
-    num_tokens, d_model,
-    stride_expert_row, stride_y_row,
+    # Dimensions
+    num_tokens,
+    d_model,
+    stride_expert_row,
+    stride_y_row,
+    # Block sizes
     BLOCK_D: tl.constexpr,
-    MAX_TOPK: tl.constexpr,
+    MAX_TOPK: tl.constexpr,  # max number of experts per token (usually 1-4)
 ):
     """
     Segment reduction kernel: sum contributions for each output token.
@@ -2296,28 +2431,35 @@ def _segment_reduce_weighted_kernel(
     1. Processes one OUTPUT token per program (not one input position)
     2. Reads the segment of inputs that map to this output
     3. Sums them up (no atomics needed!)
-    """
-    token_id = tl.program_id(0)
-    d_block = tl.program_id(1)
     
-    if token_id >= num_tokens:
-        return
+    This is MUCH faster because:
+    - Reads are coalesced (segment is contiguous after sorting)
+    - Writes are coalesced (one output row per program)  
+    - No atomic contention
+    
+    Grid: (num_tokens, ceil(d_model / BLOCK_D))
+    """
+    token_id = tl.program_id(0)  # which output token
+    d_block = tl.program_id(1)   # which d_model block
+    
+    if token_id >= num_tokens: return
     
     # Load segment bounds for this token
     seg_start = tl.load(segment_offsets_ptr + token_id)
-    seg_end = tl.load(segment_offsets_ptr + token_id + 1)
+    seg_end   = tl.load(segment_offsets_ptr + token_id + 1)
     
     # d_model offsets for this block
     d_offs = d_block * BLOCK_D + tl.arange(0, BLOCK_D)
     d_mask = d_offs < d_model
     
-    # Accumulate in FP32 for numerical precision
+    # Accumulate contributions from this segment (in fp32 for precision)
     acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
     
     # Unrolled loop over segment (MAX_TOPK is small, typically 1-4)
-    for k in range(MAX_TOPK):
+    for k in tl.static_range(MAX_TOPK):
         pos = seg_start + k
         if pos < seg_end:
+            # Load weight and expert output
             weight = tl.load(sorted_weights_ptr + pos)
             expert_out = tl.load(
                 expert_output_ptr + pos * stride_expert_row + d_offs,
@@ -2325,44 +2467,67 @@ def _segment_reduce_weighted_kernel(
             )
             acc += expert_out.to(tl.float32) * weight.to(tl.float32)
     
-    # Store result (convert back to input dtype)
+    # Store result (convert back to input dtype - bf16/fp16/fp32)
     tl.store(y_flat_ptr + token_id * stride_y_row + d_offs, acc, mask=d_mask)
 
 
 def fused_scatter_add_weighted(
     expert_output: torch.Tensor,    # (num_sorted, d_model) - raw expert outputs
-    sorted_token_idx: torch.Tensor, # (num_sorted,) - target token indices
+    sorted_token_idx: torch.Tensor, # (num_sorted,) - target token indices (NOT sorted by target)
     sorted_weights: torch.Tensor,   # (num_sorted,) - weights
-    num_tokens: int,
-    top_k: int = 2,
+    num_tokens: int,                # number of original tokens
+    top_k: int = 1,                 # experts per token (for optimization hints)
 ) -> torch.Tensor:
     """
-    Optimized scatter-add using segment reduction (no atomics).
-    Re-sorts data by target token to enable contiguous segment access.
+    Optimized scatter-add with weight multiplication using segment reduction.
+    
+    This function re-sorts the data by target token to enable efficient 
+    segment reduction (no atomic operations needed).
+    
+    Computes: y_flat[idx, :] = sum(expert_output[i, :] * weight[i]) for all i where idx[i] == token
+    
+    Performance characteristics:
+    - Sort by target: O(N log N) but highly optimized on GPU
+    - Segment reduction: O(N * d_model / parallelism), fully coalesced, no atomics
+    - Much faster than atomic scatter-add for typical MoE configurations
     """
+    _, d_model = expert_output.shape
+    device = expert_output.device
+    dtype = expert_output.dtype
+    
     # Re-sort by target token index to enable segment reduction
     sort_perm = torch.argsort(sorted_token_idx)
     expert_output_sorted = expert_output[sort_perm]
     weights_sorted = sorted_weights[sort_perm]
-    target_idx_sorted = sorted_token_idx[sort_perm]
     
-    # Compute segment offsets using searchsorted (CSR format)
-    token_ids = torch.arange(num_tokens + 1, device=expert_output.device, dtype=torch.int64)
-    segment_offsets = torch.searchsorted(target_idx_sorted.contiguous(), token_ids)
+    # Compute segment offsets: where each token's segment starts/ends
+    # For fixed top_k, offsets are simply [0, top_k, 2*top_k, ...]
+    segment_offsets = torch.arange(num_tokens+1, device=device, dtype=torch.int64) * top_k
     
-    # Launch Triton kernel
-    y_flat = torch.empty(num_tokens, d_model, device=expert_output.device, dtype=torch.float32)
-    BLOCK_D = min(triton.next_power_of_2(d_model), 256)
+    MAX_TOPK = top_k
+    BLOCK_D = min(triton.next_power_of_2(d_model), 512)
     grid = (num_tokens, triton.cdiv(d_model, BLOCK_D))
     
+    y_flat = torch.empty(num_tokens, d_model, device=device, dtype=dtype)
     _segment_reduce_weighted_kernel[grid](
-        expert_output_sorted, weights_sorted, segment_offsets, y_flat,
-        num_tokens, d_model, expert_output.stride(0), y_flat.stride(0),
-        BLOCK_D=BLOCK_D, MAX_TOPK=triton.next_power_of_2(max(top_k, 2)),
+        expert_output_sorted, weights_sorted, segment_offsets,
+        y_flat,
+        num_tokens, d_model,
+        expert_output_sorted.stride(0), y_flat.stride(0),
+        BLOCK_D=BLOCK_D,
+        MAX_TOPK=MAX_TOPK,
     )
     
-    return y_flat.to(expert_output.dtype)
+    return y_flat
 ```
+
+**Key Design Decisions:**
+
+1. **Fixed Segment Offsets**: Since each token receives contributions from exactly `top_k` experts, segment offsets follow a simple arithmetic sequence `[0, top_k, 2*top_k, ...]`. This eliminates the need for `searchsorted()` computation.
+
+2. **Static Range Loop Unrolling**: Using `tl.static_range(MAX_TOPK)` allows the Triton compiler to fully unroll the inner loop for small `top_k` values (typically 1-4), eliminating loop overhead.
+
+3. **FP32 Accumulation**: The kernel accumulates in FP32 regardless of input dtype to maintain numerical precision, then converts back to the original dtype when storing results.
 
 **Performance Impact:**
 
@@ -2390,11 +2555,11 @@ expert_token_counts = torch.bincount(
 
 **Problem Analysis:**
 
-Systematic profiling using PyTorch Profiler revealed two categories of inefficiencies that persisted even after the major architectural optimizations: redundant computations and excessive data type conversions. The most significant redundancy was the duplicate `torch.bincount()` computation—Gate computed `expert_load` for bias updates, and MOE separately computed `expert_token_counts` for routing offsets, despite both being mathematically identical operations on the same input tensor. With 11 MoE layers and 5 profiling steps, this resulted in 110 bincount calls where only 55 were necessary. Each bincount triggers a GPU kernel launch and subsequent `.tolist()` synchronization, contributing approximately 360ms of CPU time (12.5% of total). The data copy analysis revealed additional inefficiencies: the `_compute_sequence_balance_loss` function performed a full tensor dtype conversion on the large `expert_mask` tensor (shape: batch × seq_len × top_k × n_experts) using `.to(scores.dtype)`, consuming unnecessary memory bandwidth. The inference path (`moe_infer`) repeatedly converted weights dtype inside the expert loop, and used `repeat()` instead of `expand()` for index expansion—`repeat()` allocates new memory and copies data, while `expand()` returns a view without copying. Profiling showed `aten::_to_copy` being called 260 times, consuming 357ms of CPU time, with much of this being redundant conversions that could be hoisted outside loops or eliminated entirely through careful dtype management.
+Systematic profiling using PyTorch Profiler revealed two categories of inefficiencies that persisted even after the major architectural optimizations: redundant computations and excessive data type conversions. The most significant redundancy was the duplicate expert count computation—Gate computed `expert_load` for bias updates, and MOE separately computed `expert_token_counts` for routing offsets, despite both being mathematically identical operations on the same input tensor. With 11 MoE layers and 5 profiling steps, this resulted in 110 count operations where only 55 were necessary. Note: Our current implementation uses `F.one_hot().sum()` instead of `torch.bincount()` as it's faster for small numbers of experts (typically 4-16). Each count operation triggers a GPU kernel launch and subsequent `.tolist()` synchronization, contributing approximately 360ms of CPU time (12.5% of total). The data copy analysis revealed additional inefficiencies: the `_compute_sequence_balance_loss` function performed a full tensor dtype conversion on the large `expert_mask` tensor (shape: batch × seq_len × top_k × n_experts) using `.to(scores.dtype)`, consuming unnecessary memory bandwidth. The inference path (`moe_infer`) repeatedly converted weights dtype inside the expert loop, and used `repeat()` instead of `expand()` for index expansion—`repeat()` allocates new memory and copies data, while `expand()` returns a view without copying. Profiling showed `aten::_to_copy` being called 260 times, consuming 357ms of CPU time, with much of this being redundant conversions that could be hoisted outside loops or eliminated entirely through careful dtype management.
 
 **Solution Approach:**
 
-The optimization strategy addresses both redundancy categories through systematic code refactoring. For the duplicate bincount, we modify Gate to return `expert_token_counts` as an additional output, allowing MOE to directly reuse this value instead of recomputing it. This requires changing the Gate forward signature from `return topk_indices, topk_weights, aux_seq_loss` to `return topk_indices, topk_weights, aux_seq_loss, expert_token_counts`, with corresponding updates in MOE.forward() to unpack and use the returned counts. For dtype conversions, we apply three targeted optimizations: (1) In Gate.forward(), add a dtype check before converting `expert_bias`—if already matching, skip the conversion entirely; (2) In `_compute_sequence_balance_loss`, defer dtype conversion until after the `sum()` reduction—converting the small `(bsz, n_experts)` result tensor is far cheaper than converting the large `(bsz, seq_len×top_k, n_experts)` mask; (3) In `moe_infer`, pre-convert weights dtype once before the expert loop, and replace `repeat()` with `expand()` for index expansion. These changes maintain functional equivalence while eliminating redundant operations. The optimization philosophy follows a key principle: **move invariant operations outside loops, and prefer views over copies**.
+The optimization strategy addresses both redundancy categories through systematic code refactoring. For the duplicate expert count computation, we modify Gate to return `expert_token_counts` as an additional output, allowing MOE to directly reuse this value instead of recomputing it. This requires changing the Gate forward signature from `return topk_indices, topk_weights, aux_seq_loss` to `return topk_indices, topk_weights, aux_seq_loss, expert_token_counts`, with corresponding updates in MOE.forward() to unpack and use the returned counts. For dtype conversions, we apply three targeted optimizations: (1) In Gate.forward(), add a dtype check before converting `expert_bias`—if already matching, skip the conversion entirely; (2) In `_compute_sequence_balance_loss`, defer dtype conversion until after the `sum()` reduction—converting the small `(bsz, n_experts)` result tensor is far cheaper than converting the large `(bsz, seq_len×top_k, n_experts)` mask; (3) In `moe_infer`, pre-convert weights dtype once before the expert loop, and replace `repeat()` with `expand()` for index expansion. These changes maintain functional equivalence while eliminating redundant operations. The optimization philosophy follows a key principle: **move invariant operations outside loops, and prefer views over copies**.
 
 **Optimized Code (`model/architecture/moe.py`):**
 
@@ -2459,13 +2624,13 @@ def moe_infer(self, x, flat_expert_indices, flat_expert_weights):
 
 **Performance Impact:**
 
-The optimizations deliver measurable improvements across multiple profiling metrics. The `aten::bincount` call count decreases from 110 to 55 (50% reduction), validating the elimination of redundant computations. The `aten::item` call count decreases from 120 to 65 (45.8% reduction), indicating fewer synchronization points. The `aten::_to_copy` call count decreases from 260 to 205 (21.2% reduction), reflecting the dtype optimization benefits. The `cudaStreamSynchronize` count decreases from 285 to 230 (19.3% reduction), demonstrating reduced CPU-GPU synchronization overhead. In aggregate, these optimizations yield a modest but measurable throughput improvement: average step time decreases from 0.524s to 0.521s, and tokens per second increases from 62,530 to 62,843 (0.5% improvement). While the percentage gain appears small, it represents the extraction of remaining inefficiencies after the major architectural optimizations—the profiling-guided approach successfully identified and eliminated these "long tail" performance issues that would otherwise be invisible without systematic measurement. The optimizations also improve code quality by eliminating redundancy and making the data flow more explicit, facilitating future maintenance and extension.
+The optimizations deliver measurable improvements across multiple profiling metrics. The expert count operation call count decreases from 110 to 55 (50% reduction), validating the elimination of redundant computations. The `aten::item` call count decreases from 120 to 65 (45.8% reduction), indicating fewer synchronization points. The `aten::_to_copy` call count decreases from 260 to 205 (21.2% reduction), reflecting the dtype optimization benefits. The `cudaStreamSynchronize` count decreases from 285 to 230 (19.3% reduction), demonstrating reduced CPU-GPU synchronization overhead. In aggregate, these optimizations yield a modest but measurable throughput improvement: average step time decreases from 0.524s to 0.521s, and tokens per second increases from 62,530 to 62,843 (0.5% improvement). While the percentage gain appears small, it represents the extraction of remaining inefficiencies after the major architectural optimizations—the profiling-guided approach successfully identified and eliminated these "long tail" performance issues that would otherwise be invisible without systematic measurement. The optimizations also improve code quality by eliminating redundancy and making the data flow more explicit, facilitating future maintenance and extension.
 
 **Profiling Comparison Summary:**
 
 | Metric | Before Optimization | After Optimization | Improvement |
 |--------|--------------------|--------------------|-------------|
-| `aten::bincount` calls | 110 | 55 | **-50%** |
+| Expert count operations | 110 | 55 | **-50%** |
 | `aten::item` calls | 120 | 65 | **-45.8%** |
 | `cudaStreamSynchronize` calls | 285 | 230 | **-19.3%** |
 | `aten::_to_copy` calls | 260 | 205 | **-21.2%** |
@@ -2476,7 +2641,7 @@ The optimizations deliver measurable improvements across multiple profiling metr
 
 #### Remaining Bottlenecks and Future Optimization Directions
 
-Despite the comprehensive optimizations applied, profiling reveals that certain architectural constraints impose fundamental performance limits that cannot be overcome through PyTorch-level optimizations alone. The primary remaining bottleneck is the **`.tolist()` synchronization** required to extract expert routing offsets for the Python-level expert loop. Even with duplicate bincount eliminated, each MoE layer still requires one `.tolist()` call to convert GPU tensor offsets to Python integers for loop indexing, resulting in 55 synchronizations across 11 layers that collectively consume 43.6% of CPU time (1.251s). This synchronization is inherent to the sequential expert processing paradigm where each expert's input slice depends on runtime routing decisions.
+Despite the comprehensive optimizations applied, profiling reveals that certain architectural constraints impose fundamental performance limits that cannot be overcome through PyTorch-level optimizations alone. The primary remaining bottleneck is the **`.tolist()` synchronization** required to extract expert routing counts for the Python-level expert loop. Even with duplicate count computation eliminated, each MoE layer still requires one `.tolist()` call to convert GPU tensor counts to Python integers for `torch.split()` chunking, resulting in 55 synchronizations across 11 layers that collectively consume 43.6% of CPU time (1.251s). This synchronization is inherent to the sequential expert processing paradigm where each expert's input slice depends on runtime routing decisions.
 
 **Future Optimization Directions:**
 

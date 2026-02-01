@@ -35,15 +35,14 @@ def _segment_reduce_weighted_kernel(
     
     Grid: (num_tokens, ceil(d_model / BLOCK_D))
     """
-    token_id = tl.program_id(0)    # which output token
-    d_block = tl.program_id(1)     # which d_model block
+    token_id = tl.program_id(0)  # which output token
+    d_block = tl.program_id(1)   # which d_model block
     
-    if token_id >= num_tokens:
-        return
+    if token_id >= num_tokens: return
     
     # Load segment bounds for this token
     seg_start = tl.load(segment_offsets_ptr + token_id)
-    seg_end = tl.load(segment_offsets_ptr + token_id + 1)
+    seg_end   = tl.load(segment_offsets_ptr + token_id + 1)
     
     # d_model offsets for this block
     d_offs = d_block * BLOCK_D + tl.arange(0, BLOCK_D)
@@ -53,7 +52,7 @@ def _segment_reduce_weighted_kernel(
     acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
     
     # Unrolled loop over segment (MAX_TOPK is small, typically 1-4)
-    for k in range(MAX_TOPK):
+    for k in tl.static_range(MAX_TOPK):
         pos = seg_start + k
         if pos < seg_end:
             # Load weight and expert output
@@ -65,7 +64,6 @@ def _segment_reduce_weighted_kernel(
             acc += expert_out.to(tl.float32) * weight.to(tl.float32)
     
     # Store result (convert back to input dtype - bf16/fp16/fp32)
-    # Note: the dtype is inferred from the output pointer type
     tl.store(y_flat_ptr + token_id * stride_y_row + d_offs, acc, mask=d_mask)
 
 
@@ -92,37 +90,28 @@ def segment_reduce_weighted(
     Returns:
         y_flat: Accumulated output, shape (num_tokens, d_model)
     """
-    num_sorted, d_model = expert_output.shape
+    _, d_model = expert_output.shape
     device = expert_output.device
     dtype = expert_output.dtype
     
-    # Compute segment offsets (CSR format): where each token's segment starts/ends
-    # Since sorted_token_idx is sorted, we can use searchsorted
-    token_ids = torch.arange(num_tokens + 1, device=device, dtype=torch.int64)
-    segment_offsets = torch.searchsorted(sorted_token_idx.contiguous(), token_ids)
+    # Compute segment offsets: where each token's segment starts/ends
+    segment_offsets = torch.arange(num_tokens+1, device=device, dtype=torch.int64) * top_k
     
-    # Allocate output (use fp32 for kernel accumulation, convert at end)
-    # This matches the kernel's fp32 accumulator and avoids precision loss
-    y_flat_fp32 = torch.empty(num_tokens, d_model, device=device, dtype=torch.float32)
-    
-    # Choose block size
-    BLOCK_D = min(triton.next_power_of_2(d_model), 256)
-    MAX_TOPK = triton.next_power_of_2(max(top_k, 2))  # at least 2 for unrolling
-    
-    # Grid: one program per (token, d_block)
+    MAX_TOPK = top_k
+    BLOCK_D = min(triton.next_power_of_2(d_model), 512)
     grid = (num_tokens, triton.cdiv(d_model, BLOCK_D))
     
+    y_flat = torch.empty(num_tokens, d_model, device=device, dtype=dtype)
     _segment_reduce_weighted_kernel[grid](
         expert_output, sorted_weights, segment_offsets,
-        y_flat_fp32,
+        y_flat,
         num_tokens, d_model,
-        expert_output.stride(0), y_flat_fp32.stride(0),
+        expert_output.stride(0), y_flat.stride(0),
         BLOCK_D=BLOCK_D,
         MAX_TOPK=MAX_TOPK,
     )
     
-    # Convert back to original dtype
-    return y_flat_fp32.to(dtype)
+    return y_flat
 
 
 def fused_scatter_add_weighted(
@@ -130,7 +119,7 @@ def fused_scatter_add_weighted(
     sorted_token_idx: torch.Tensor, # (num_sorted,) - target token indices (NOT sorted by target)
     sorted_weights: torch.Tensor,   # (num_sorted,) - weights
     num_tokens: int,                # number of original tokens
-    top_k: int = 2,                 # experts per token (for optimization hints)
+    top_k: int = 1,                 # experts per token (for optimization hints)
 ) -> torch.Tensor:
     """
     Optimized scatter-add with weight multiplication using segment reduction.

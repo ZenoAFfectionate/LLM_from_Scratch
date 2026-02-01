@@ -23,11 +23,9 @@ class Embedding(nn.Module):
         super().__init__()
         self.num_embeddings = num_embeddings  # the size of vocab
         self.embedding_dim = embedding_dim    # dim of emb vector
-        if dtype is None:
-            dtype = torch.float32  # default to FP32
+        if dtype is None: dtype = torch.float32  # default to FP32
         # create an uninitialized tensor on requested device and dtype
-        weight = torch.empty((num_embeddings, embedding_dim),
-                             device=device, dtype=dtype)
+        weight = torch.empty((num_embeddings, embedding_dim), device=device, dtype=dtype)
         # initialize the weight matrix and warp in Parameter
         nn.init.trunc_normal_(weight, mean=0.0, std=1.0, a=-3, b=+3)
         self.weight = nn.Parameter(weight)
@@ -35,16 +33,14 @@ class Embedding(nn.Module):
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
         ''' select the embedding vector of each token ID by indexing into an embedding matrix
             of shape (vocab_size, d_model) using token IDs with shape (batch_size, seq_len) '''
-        return self.weight[token_ids.long()]  # cast to torch.int64
+        return self.weight[token_ids.long()]
 
 
 # -------------------------------------
 #  Problem 3: Implement RMSNorm Module
 # -------------------------------------
 class RMSNorm(nn.Module):
-    """
-    PyTorch implementation of Root Mean Square Normalization with optional Fused Add & Norm.
-    """
+    """Root Mean Square Normalization with Fused Add & Norm."""
 
     def __init__(self, d_model: int, eps: float = 1e-5, device=None):
         super().__init__()
@@ -52,19 +48,17 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(d_model, dtype=torch.float32, device=device))
 
     def forward(self, x: torch.Tensor, residual: Optional[torch.Tensor] = None):
-        """Forward pass with optional fused residual addition"""
         dtype = x.dtype
         if residual is None:
             x = x.float()
-            # [OPT] Use rsqrt of mean(x^2) directly, avoid storing intermediate pow result
-            rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-            return (self.weight * x * rms).to(dtype)
+            var = x.pow(2).mean(-1, keepdim=True)
+            x = x * torch.rsqrt(var + self.eps)
+            return (self.weight * x).to(dtype)
         else:
-            # [OPT] Use add_ for in-place addition on new tensor (safe for autograd)
-            x = x.float().add_(residual.float())
-            residual = x  # share memory, no copy needed
-            rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-            return (self.weight * x * rms).to(dtype), residual.to(dtype)
+            x = residual = x.float() + residual.float()
+            var = x.pow(2).mean(-1, keepdim=True)
+            x = x * torch.rsqrt(var + self.eps)
+            return (self.weight * x).to(dtype), residual.to(dtype)
 
 
 # ---------------------------------------------------

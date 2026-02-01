@@ -1,5 +1,5 @@
 {
-    "run_name": "MLA and MoE on OpenWebText",
+    "run_name": "DSA and MoE on OpenWebText",
     "seed": 42,
     "dataset": "OpenWebText",
     "data_dir": "/home/kemove/Courses/STF_LLM/Assignment_1/data/OpenWebText",
@@ -10,7 +10,8 @@
     "special_tokens": [
         "<|endoftext|>"
     ],
-    "attention_type": "MLA",
+
+    "attention_type": "DSA",
     "context_length": 2048,
     "d_model": 768,
     "num_layers": 12,
@@ -18,28 +19,24 @@
     "d_ff": 3072,
     "rope_theta": 10000.0,
     "dropout": 0.1,
+
+    "rope_dim": 16,
+    "kv_lora_rank": 192,
+    "q_lora_rank": 96,
+
+    "index_topk": 256,
+    "scale_fmt": "ue8m0",
+    "max_batch_size": 16,
+    "max_seq_len": 2048,
+
     "use_moe": true,
-    "moe_layers": [
-        1,
-        2,
-        3,
-        4,
-        5,
-        6,
-        7,
-        8,
-        9,
-        10,
-        11
-    ],
+    "moe_layers": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
     "n_routed_experts": 8,
     "num_experts_per_tok": 1,
     "n_shared_experts": 1,
     "aux_seq_loss_alpha": 0.01,
     "bias_update_speed": 0.01,
-    "rope_dim": 16,
-    "q_lora_rank": 192,
-    "kv_lora_rank": 96,
+
     "batch_size": 16,
     "max_iterations": 32000,
     "max_lr": 2e-04,
@@ -50,9 +47,17 @@
     "eps": 1e-08,
     "weight_decay": 0.1,
     "max_grad_norm": 1.0,
-    "log_interval": 1,
+
+    "warmup_stage_lr": 1e-03,
+    "warmup_stage_steps": 1000,
+    "sparse_stage_lr": 7.3e-06,
+    "sparse_indexer_lr": 1e-04,
+    "sparse_stage_steps": 15000,
+
+    "log_interval": 100,
     "eval_interval": 1000,
     "eval_batches": 800,
     "checkpoint_dir": "/home/kemove/Courses/STF_LLM/Assignment_1/checkpoints",
+    "num_workers": 8,
     "use_amp": true
 }

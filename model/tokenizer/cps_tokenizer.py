@@ -2,7 +2,7 @@ import os
 import json
 
 import numpy as np
-from bpe_tokenizer import Tokenizer
+from model.tokenizer.bpe_tokenizer import Tokenizer
 from tokenizers import normalizers, Regex
 
 

@@ -56,22 +56,20 @@ class GroupedQueryAttention(nn.Module):
         self.k_norm = nn.RMSNorm(num_kv_heads*self.head_dim, device=device)
         self.rope = rope
 
-    def forward(self, x: torch.Tensor, start_pos: int = 0, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Forward pass for training mode.
 
         Args:
             x: Input tensor of shape (batch_size, seq_len, d_model)
-            start_pos: Starting position for RoPE
             mask: Optional attention mask
 
         Returns:
             output: Output tensor with same shape as input
         """
         bsz, seq_len, d_model = x.shape
-        # generate token positions based on start_pos
-        token_positions = torch.arange(
-            start_pos, start_pos + seq_len, device=x.device)
+        # Generate token positions (always starting from 0 for training)
+        token_positions = torch.arange(seq_len, device=x.device)
 
         q = self.q_proj(x)
         q = self.q_norm(q)  # [OPT] add RMSNorm for q
@@ -89,7 +87,7 @@ class GroupedQueryAttention(nn.Module):
                    self.head_dim).transpose(1, 2)
 
         # apply RoPE to q and k using token_positions
-        if self.rope is not None:
+        if self.rope:
             q = self.rope(q, token_positions)
             k = self.rope(k, token_positions)
 

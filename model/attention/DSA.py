@@ -97,14 +97,13 @@ class Indexer(nn.Module):
         self,
         x: torch.Tensor,
         q: torch.Tensor,
-        start_pos: int,
         mask: Optional[torch.Tensor] = None,
         return_scores: bool = False
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward pass to compute index scores and select top-k tokens."""
         batch_size, seq_len, _ = x.shape
-        end_pos = start_pos + seq_len
-        token_positions = torch.arange(start_pos, end_pos, device=x.device)
+        # Generate token positions (always starting from 0 for training)
+        token_positions = torch.arange(seq_len, device=x.device)
 
         # Project query and key
         q = self.q_proj(q)
@@ -177,12 +176,11 @@ class Indexer(nn.Module):
         self,
         x: torch.Tensor,
         q: torch.Tensor,
-        start_pos: int,
         mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """Compute the indexer's probability distribution over all positions."""
         _, index_scores = self.forward(
-            x, q, start_pos, mask, return_scores=True)
+            x, q, mask, return_scores=True)
         return F.softmax(index_scores, dim=-1)
 
 
@@ -289,7 +287,6 @@ class DeepseekSparseAttention(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        start_pos: int = 0,
         mask: Optional[torch.Tensor] = None,
         use_sparse: bool = True,
         return_attention: bool = False
@@ -299,7 +296,6 @@ class DeepseekSparseAttention(nn.Module):
 
         Args:
             x: Input tensor, shape (batch, seq_len, d_model)
-            start_pos: Starting position for RoPE
             mask: Optional attention mask (True = attend, False = mask)
             use_sparse: If True, use sparse attention via indexer. If False, use dense attention.
             return_attention: If True, return attention weights for indexer training
@@ -309,8 +305,8 @@ class DeepseekSparseAttention(nn.Module):
             attn_weights: Attention weights if return_attention=True, else None
         """
         batch, seq_len, _ = x.shape
-        token_positions = torch.arange(
-            start_pos, start_pos + seq_len, device=x.device)
+        # Generate token positions (always starting from 0 for training)
+        token_positions = torch.arange(seq_len, device=x.device)
 
         # =========
         # Process Q
@@ -383,7 +379,7 @@ class DeepseekSparseAttention(nn.Module):
         if use_sparse:
             # Get indexer outputs
             topk_indices, index_scores = self.indexer(
-                x, q_compressed, start_pos, mask, return_scores=True
+                x, q_compressed, mask, return_scores=True
             )
 
             # Create sparse attention mask
@@ -660,7 +656,6 @@ class DeepseekSparseAttention(nn.Module):
     def _compute_attention_weights_only(
         self,
         x: torch.Tensor,
-        start_pos: int,
         mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
@@ -668,8 +663,8 @@ class DeepseekSparseAttention(nn.Module):
         This is more efficient than calling forward() when we only need attention weights.
         """
         batch, seq_len, _ = x.shape
-        token_positions = torch.arange(
-            start_pos, start_pos + seq_len, device=x.device)
+        # Generate token positions (always starting from 0 for training)
+        token_positions = torch.arange(seq_len, device=x.device)
 
         # Process Q
         q_compressed = self.q_norm(self.q_down_proj(x))
@@ -707,7 +702,6 @@ class DeepseekSparseAttention(nn.Module):
     def compute_target_distribution(
         self,
         x: torch.Tensor,
-        start_pos: int,
         mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
@@ -715,7 +709,7 @@ class DeepseekSparseAttention(nn.Module):
         [OPT] Uses lightweight attention weight computation instead of full forward.
         """
         # [OPT] Compute attention weights only, not full forward
-        attn_weights = self._compute_attention_weights_only(x, start_pos, mask)
+        attn_weights = self._compute_attention_weights_only(x, mask)
 
         # Sum across heads and L1-normalize
         summed_weights = attn_weights.sum(dim=1)
@@ -725,16 +719,14 @@ class DeepseekSparseAttention(nn.Module):
         self,
         x: torch.Tensor,
         q_compressed: torch.Tensor,  # [OPT] Accept pre-computed q_compressed
-        start_pos: int,
         mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """Get the indexer's probability distribution for KL-divergence computation."""
-        return self.indexer.compute_index_distribution(x, q_compressed, start_pos, mask)
+        return self.indexer.compute_index_distribution(x, q_compressed, mask)
 
     def compute_indexer_loss_dense(
         self,
         x: torch.Tensor,
-        start_pos: int,
         mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
@@ -745,11 +737,11 @@ class DeepseekSparseAttention(nn.Module):
         q_compressed = self.q_norm(self.q_down_proj(x))
 
         # Get target distribution from main attention
-        target_dist = self.compute_target_distribution(x, start_pos, mask)
+        target_dist = self.compute_target_distribution(x, mask)
 
         # Get indexer distribution (reuse q_compressed)
         indexer_dist = self.get_indexer_distribution(
-            x, q_compressed, start_pos, mask)
+            x, q_compressed, mask)
 
         # [OPT] Use log_softmax form of KL-divergence for numerical stability
         # KL(p||q) = sum(p * (log(p) - log(q))) = sum(p * log(p)) - sum(p * log(q))
@@ -765,7 +757,6 @@ class DeepseekSparseAttention(nn.Module):
     def compute_indexer_loss_sparse(
         self,
         x: torch.Tensor,
-        start_pos: int,
         mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
@@ -777,11 +768,11 @@ class DeepseekSparseAttention(nn.Module):
 
         # Get indexer outputs with scores (this computes everything we need from indexer)
         topk_indices, index_scores = self.indexer(
-            x, q_compressed, start_pos, mask, return_scores=True
+            x, q_compressed, mask, return_scores=True
         )
 
         # Get target distribution (only compute attention weights, not full forward)
-        target_dist = self.compute_target_distribution(x, start_pos, mask)
+        target_dist = self.compute_target_distribution(x, mask)
 
         # [OPT] Gather and normalize in single pass
         # Gather target distribution at selected positions

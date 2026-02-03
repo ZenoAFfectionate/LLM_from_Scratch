@@ -46,5 +46,6 @@
     "eval_interval": 500,
     "eval_batches": 50,
     "checkpoint_dir": "/home/kemove/Courses/STF_LLM/Assignment_1/checkpoints",
-    "use_amp": true
+    "use_amp": true,
+    "optimizer": "muon"
 }

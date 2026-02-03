@@ -106,16 +106,15 @@ class Muon(torch.optim.Optimizer):
                     # compute and cache scaling factor
                     if p.ndim >= 2:
                         m, n = p.shape[-2], p.shape[-1]
-                        scale_value = max(1.0, m / n) ** 0.5
-                        state["scaling_factor"] = scale_value
+                        state["scaling_factor"] = max(1.0, m / n) ** 0.5
                     else:
                         state["scaling_factor"] = 1.0
 
                 # compute Muon update with orthogonalization
                 update = muon_update(
                     p.grad,
-                    state["momentum_buffer"],  # 
-                    state["scaling_factor"],   # 
+                    state["momentum_buffer"],
+                    state["scaling_factor"],
                     beta=group["momentum"],
                     ns_steps=group["ns_steps"],
                     nesterov=group["nesterov"]
@@ -126,127 +125,6 @@ class Muon(torch.optim.Optimizer):
                 p.add_(update.reshape(p.shape), alpha=-group["lr"])
 
         return loss
-
-
-def separate_params_for_muon(
-    model: nn.Module,
-    muon_lr: float = 0.02,
-    adamw_lr: float = 3e-4,
-    muon_weight_decay: float = 0.0,
-    adamw_weight_decay: float = 0.1,
-    support_engram: bool = False,
-) -> Tuple[List[Dict], List[Dict], Dict[str, int]]:
-    """
-    Separate model parameters into Muon and AdamW groups.
-    
-    Muon is used for 2D hidden weight matrices (attention and FFN layers).
-    AdamW is used for:
-    - Token embeddings
-    - lm_head
-    - Engram multi-head embeddings (when support_engram=True)
-    - Biases and 1D parameters (norms, etc.)
-    
-    Args:
-        model: The transformer model (with or without Engram)
-        muon_lr: Learning rate for Muon optimizer
-        adamw_lr: Learning rate for AdamW optimizer
-        muon_weight_decay: Weight decay for Muon parameters
-        adamw_weight_decay: Weight decay for AdamW parameters
-        support_engram: Whether to handle Engram-specific parameters
-        
-    Returns:
-        Tuple of (muon_param_groups, adamw_param_groups, stats_dict)
-        stats_dict contains parameter counts for logging
-    """
-    muon_params = []
-    adamw_params = []
-    adamw_params_no_decay = []  # For biases and 1D params
-    
-    # Track parameter counts for logging
-    muon_param_count = 0
-    adamw_param_count = 0
-    adamw_no_decay_count = 0
-    engram_param_count = 0
-    
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-            
-        # Determine parameter type based on name and shape
-        is_embedding = 'token_embeddings' in name or 'embedding' in name.lower()
-        is_lm_head = 'lm_head' in name
-        is_bias = 'bias' in name or name.endswith('.b')
-        is_norm = 'norm' in name.lower() or 'ln' in name.lower() or 'layernorm' in name.lower()
-        is_scale = 'scale' in name or 'gamma' in name
-        
-        # Check if this is an Engram parameter (only when support_engram is enabled)
-        is_engram = support_engram and ('engram' in name.lower())
-        is_engram_embedding = is_engram and ('multi_head_embedding' in name or 'embedding' in name.lower())
-        
-        # Check if parameter is 2D and suitable for Muon
-        is_2d_weight = param.ndim >= 2
-        
-        # Muon criteria: 2D weight that is NOT embedding, lm_head, Engram embedding, or special params
-        use_muon = (
-            is_2d_weight and
-            not is_embedding and
-            not is_lm_head and
-            not is_bias and
-            not is_norm and
-            not is_scale and
-            not is_engram_embedding  # Engram embeddings should use AdamW
-        )
-        
-        if use_muon:
-            muon_params.append(param)
-            muon_param_count += param.numel()
-        elif is_bias or is_norm or is_scale or param.ndim == 1:
-            # No weight decay for biases and 1D params
-            adamw_params_no_decay.append(param)
-            adamw_no_decay_count += param.numel()
-        else:
-            # Embeddings, lm_head, and Engram embeddings with weight decay
-            adamw_params.append(param)
-            adamw_param_count += param.numel()
-            if is_engram:
-                engram_param_count += param.numel()
-    
-    # Print parameter distribution
-    total_params = muon_param_count + adamw_param_count + adamw_no_decay_count
-    print(f"\n{'='*60}")
-    if support_engram:
-        print("Parameter Distribution for Muon + AdamW Optimization (Engram):")
-    else:
-        print("Parameter Distribution for Muon + AdamW Optimization:")
-    print(f"{'='*60}")
-    print(f"  Muon parameters (2D hidden weights):    {muon_param_count:>12,} ({100*muon_param_count/total_params:.1f}%)")
-    print(f"  AdamW parameters (with decay):          {adamw_param_count:>12,} ({100*adamw_param_count/total_params:.1f}%)")
-    if support_engram and engram_param_count > 0:
-        print(f"    - Engram parameters:                  {engram_param_count:>12,} ({100*engram_param_count/total_params:.1f}%)")
-    print(f"  AdamW parameters (no decay):            {adamw_no_decay_count:>12,} ({100*adamw_no_decay_count/total_params:.1f}%)")
-    print(f"  Total trainable parameters:             {total_params:>12,}")
-    print(f"{'='*60}\n")
-    
-    # Build param groups
-    muon_param_groups = [
-        {'params': muon_params, 'lr': muon_lr, 'weight_decay': muon_weight_decay}
-    ]
-    
-    adamw_param_groups = [
-        {'params': adamw_params, 'lr': adamw_lr, 'weight_decay': adamw_weight_decay},
-        {'params': adamw_params_no_decay, 'lr': adamw_lr, 'weight_decay': 0.0}
-    ]
-    
-    # Statistics for external use
-    stats = {
-        'muon_params': muon_param_count,
-        'adamw_params': adamw_param_count,
-        'adamw_no_decay_params': adamw_no_decay_count,
-        'engram_params': engram_param_count,
-        'total_params': total_params,
-    }
-    
-    return muon_param_groups, adamw_param_groups, stats
 
 
 class MuonAdamWOptimizer:
@@ -393,3 +271,130 @@ class MuonAdamWOptimizer:
     def param_groups(self):
         """Return all parameter groups (for compatibility)."""
         return self.muon_optimizer.param_groups + self.adamw_optimizer.param_groups
+
+
+def separate_params_for_muon(
+    model: nn.Module,
+    muon_lr: float = 0.02,
+    adamw_lr: float = 3e-4,
+    muon_weight_decay: float = 0.0,
+    adamw_weight_decay: float = 0.1,
+    support_engram: bool = False,
+) -> Tuple[List[Dict], List[Dict], Dict[str, int]]:
+    """
+    Separate model parameters into Muon and AdamW groups.
+    
+    Muon is used for 2D hidden weight matrices (attention and FFN layers).
+    AdamW is used for:
+    - Token embeddings
+    - lm_head
+    - Engram multi-head embeddings (when support_engram=True)
+    - Biases and 1D parameters (norms, etc.)
+    
+    Args:
+        model: The transformer model (with or without Engram)
+        muon_lr: Learning rate for Muon optimizer
+        adamw_lr: Learning rate for AdamW optimizer
+        muon_weight_decay: Weight decay for Muon parameters
+        adamw_weight_decay: Weight decay for AdamW parameters
+        support_engram: Whether to handle Engram-specific parameters
+        
+    Returns:
+        Tuple of (muon_param_groups, adamw_param_groups, stats_dict)
+        stats_dict contains parameter counts for logging
+    """
+    muon_params = []
+    adamw_params = []
+    adamw_params_no_decay = []  # For biases and 1D params
+
+    # Track parameter counts for logging
+    muon_param_count = 0
+    adamw_param_count = 0
+    adamw_no_decay_count = 0
+    engram_param_count = 0
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+
+        # Determine parameter type based on name and shape
+        is_embedding = 'token_embeddings' in name or 'embedding' in name.lower()
+        is_lm_head = 'lm_head' in name
+        is_bias = 'bias' in name or name.endswith('.b')
+        is_norm = 'norm' in name.lower() or 'ln' in name.lower() or 'layernorm' in name.lower()
+        is_scale = 'scale' in name or 'gamma' in name
+
+        # Check if this is an Engram parameter (only when support_engram is enabled)
+        is_engram = support_engram and ('engram' in name.lower())
+        is_engram_embedding = is_engram and (
+            'multi_head_embedding' in name or 'embedding' in name.lower())
+
+        # Check if parameter is 2D and suitable for Muon
+        is_2d_weight = param.ndim >= 2
+
+        # Muon criteria: 2D weight that is NOT embedding, lm_head, Engram embedding, or special params
+        use_muon = (
+            is_2d_weight and
+            not is_embedding and
+            not is_lm_head and
+            not is_bias and
+            not is_norm and
+            not is_scale and
+            not is_engram_embedding
+        )
+
+        if use_muon:
+            muon_params.append(param)
+            muon_param_count += param.numel()
+        elif is_bias or is_norm or is_scale or param.ndim == 1:
+            # No weight decay for biases and 1D params
+            adamw_params_no_decay.append(param)
+            adamw_no_decay_count += param.numel()
+        else:
+            # Embeddings, lm_head, and Engram embeddings with weight decay
+            adamw_params.append(param)
+            adamw_param_count += param.numel()
+            if is_engram:
+                engram_param_count += param.numel()
+
+    # Print parameter distribution
+    total_params = muon_param_count + adamw_param_count + adamw_no_decay_count
+    print(f"\n{'='*60}")
+    if support_engram:
+        print("Parameter Distribution for Muon + AdamW Optimization (Engram):")
+    else:
+        print("Parameter Distribution for Muon + AdamW Optimization:")
+    print(f"{'='*60}")
+    print(
+        f"  Muon parameters (2D hidden weights):    {muon_param_count:>12,} ({100*muon_param_count/total_params:.1f}%)")
+    print(
+        f"  AdamW parameters (with decay):          {adamw_param_count:>12,} ({100*adamw_param_count/total_params:.1f}%)")
+    if support_engram and engram_param_count > 0:
+        print(
+            f"    - Engram parameters:                  {engram_param_count:>12,} ({100*engram_param_count/total_params:.1f}%)")
+    print(
+        f"  AdamW parameters (no decay):            {adamw_no_decay_count:>12,} ({100*adamw_no_decay_count/total_params:.1f}%)")
+    print(f"  Total trainable parameters:             {total_params:>12,}")
+    print(f"{'='*60}\n")
+
+    # Build param groups
+    muon_param_groups = [
+        {'params': muon_params, 'lr': muon_lr, 'weight_decay': muon_weight_decay}
+    ]
+
+    adamw_param_groups = [
+        {'params': adamw_params, 'lr': adamw_lr,
+            'weight_decay': adamw_weight_decay},
+        {'params': adamw_params_no_decay, 'lr': adamw_lr, 'weight_decay': 0.0}
+    ]
+
+    # Statistics for external use
+    stats = {
+        'muon_params': muon_param_count,
+        'adamw_params': adamw_param_count,
+        'adamw_no_decay_params': adamw_no_decay_count,
+        'engram_params': engram_param_count,
+        'total_params': total_params,
+    }
+
+    return muon_param_groups, adamw_param_groups, stats

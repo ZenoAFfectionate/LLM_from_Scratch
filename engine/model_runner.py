@@ -67,6 +67,14 @@ class ModelRunner:
             dtype=torch.bfloat16,
         ).cuda(rank)
         
+        # Load checkpoint if provided
+        checkpoint_path = config.get('checkpoint_path')
+        if checkpoint_path:
+            print(f"[Rank {rank}] Loading checkpoint from {checkpoint_path}...")
+            checkpoint = torch.load(checkpoint_path, map_location=f'cuda:{rank}')
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+            print(f"[Rank {rank}] Checkpoint loaded successfully!")
+        
         # Enable paged attention mode on all attention layers
         self._enable_paged_attention()
         

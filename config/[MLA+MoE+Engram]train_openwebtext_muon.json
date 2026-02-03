@@ -10,38 +10,59 @@
     "special_tokens": [
         "<|endoftext|>"
     ],
-    "attention_type": "MLA",
     "context_length": 2048,
     "d_model": 768,
     "num_layers": 12,
     "num_heads": 16,
     "d_ff": 3072,
-    "rope_theta": 10000.0,
     "dropout": 0.1,
-    
+    "attention_type": "MLA",
+    "rope_theta": 10000.0,
+    "rope_dim": 16,
+    "q_lora_rank": 192,
+    "kv_lora_rank": 96,
     "use_moe": true,
-    "moe_layers": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+    "moe_layers": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11
+    ],
     "n_routed_experts": 8,
     "num_experts_per_tok": 1,
     "n_shared_experts": 1,
     "aux_seq_loss_alpha": 0.01,
     "bias_update_speed": 0.01,
-    
-    "rope_dim": 16,
-    "kv_lora_rank": 96,
-    "q_lora_rank": 192,
-    
     "use_engram": true,
-    "engram_layer_ids": [1, 5],
+    "engram_layer_ids": [
+        1,
+        5
+    ],
     "engram_max_ngram_size": 3,
     "engram_n_embed_per_ngram": 512,
     "engram_n_head_per_ngram": 8,
-    "engram_vocab_size": [10007, 10009],
+    "engram_vocab_size": [
+        10007,
+        10009
+    ],
     "engram_kernel_size": 4,
     "engram_pad_id": 2,
     "engram_tokenizer_path": "/home/kemove/Courses/STF_LLM/Assignment_1/data/OpenWebText",
     "hc_mult": 1,
-    
+    "optimizer": "muon",
+    "muon_lr": 0.02,
+    "muon_min_lr": 0.002,
+    "muon_momentum": 0.95,
+    "muon_nesterov": true,
+    "muon_ns_steps": 5,
+    "muon_weight_decay": 0.0,
     "batch_size": 16,
     "max_iterations": 32000,
     "max_lr": 3e-04,
@@ -52,17 +73,10 @@
     "eps": 1e-08,
     "weight_decay": 0.1,
     "max_grad_norm": 1.0,
+    "use_amp": true,
     "log_interval": 100,
     "eval_interval": 1000,
     "eval_batches": 800,
-    "checkpoint_dir": "/home/kemove/Courses/STF_LLM/Assignment_1/checkpoints",
-    "use_amp": true,
     "num_workers": 8,
-
-    "muon_lr": 0.02,
-    "muon_min_lr": 0.002,
-    "muon_momentum": 0.95,
-    "muon_nesterov": true,
-    "muon_ns_steps": 5,
-    "muon_weight_decay": 0.0
+    "checkpoint_dir": "/home/kemove/Courses/STF_LLM/Assignment_1/checkpoints"
 }

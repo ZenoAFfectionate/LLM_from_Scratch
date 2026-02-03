@@ -48,22 +48,20 @@ class MultiHeadSelfAttention(nn.Module):
         self.k_norm = nn.RMSNorm(d_model, device=device)
         self.rope = rope
 
-    def forward(self, x: torch.Tensor, start_pos: int = 0, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Forward pass for training mode.
 
         Args:
             x: Input tensor of shape (batch_size, seq_len, d_model)
-            start_pos: Starting position for RoPE
             mask: Optional attention mask
 
         Returns:
             output: Output tensor with same shape as input
         """
         bsz, seq_len, d_model = x.shape
-        # Generate token positions based on start_pos
-        token_positions = torch.arange(
-            start_pos, start_pos + seq_len, device=x.device)
+        # Generate token positions (always starting from 0 for training)
+        token_positions = torch.arange(seq_len, device=x.device)
 
         # project input to q, k, v using fused projection
         q, k, v = self.qkv_proj(x).chunk(3, dim=-1)
@@ -82,8 +80,7 @@ class MultiHeadSelfAttention(nn.Module):
 
         # Training: standard attention
         attn_output = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
-        attn_output = attn_output.transpose(
-            1, 2).contiguous().view(bsz, seq_len, d_model)
+        attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, seq_len, d_model)
         return self.output_proj(attn_output)
 
     def inference(self, x: torch.Tensor) -> torch.Tensor:
@@ -139,8 +136,7 @@ class MultiHeadSelfAttention(nn.Module):
 
         # Store K, V to paged cache
         if context.slot_mapping is not None:
-            store_kvcache(k, v, self.k_cache, self.v_cache,
-                          context.slot_mapping, self.block_size)
+            store_kvcache(k, v, self.k_cache, self.v_cache, context.slot_mapping, self.block_size)
 
         if context.is_prefill:
             # Prefill: use flash attention with variable-length support
@@ -166,9 +162,8 @@ class MultiHeadSelfAttention(nn.Module):
                 self.scale, self.num_heads, self.num_heads,  # MHA: num_kv_heads = num_heads
                 self.head_dim, self.block_size
             )
-            # Output shape: (batch_size, num_heads, head_dim) -> (total_tokens, num_heads, head_dim)
-            attn_output = attn_output.view(
-                total_tokens, self.num_heads, self.head_dim)
+            # (batch_size, num_heads, head_dim) -> (total_tokens, num_heads, head_dim)
+            attn_output = attn_output.view(total_tokens, self.num_heads, self.head_dim)
 
         # Reshape and project output
         output = self.output_proj(attn_output.view(total_tokens, self.d_model))

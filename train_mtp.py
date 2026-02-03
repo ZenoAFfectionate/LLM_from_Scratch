@@ -41,7 +41,8 @@ def read_text_chunks(file_path: str, chunk_size: int = 1024*1024) -> Iterator[st
     with open(file_path, 'r', encoding='utf-8') as f:
         while True:
             chunk = f.read(chunk_size)
-            if not chunk: break
+            if not chunk:
+                break
             yield chunk
 
 
@@ -196,10 +197,12 @@ def compute_mtp_loss(
         # Get target tokens: tokens at positions [2+k : T+1] (0-indexed: [k+2 : seq_len+1])
         # For k=0: targets are tokens[2:], for k=1: targets are tokens[3:], etc.
         target_start_idx = k + 2
-        targets_k = token_ids[:, target_start_idx : target_start_idx + depth_seq_len]
+        targets_k = token_ids[:,
+                              target_start_idx: target_start_idx + depth_seq_len]
 
         # Flatten for cross-entropy
-        logits_k_flat = logits_k.reshape(-1, logits_k.size(-1))  # (batch * depth_seq_len, vocab_size)
+        # (batch * depth_seq_len, vocab_size)
+        logits_k_flat = logits_k.reshape(-1, logits_k.size(-1))
         targets_k_flat = targets_k.reshape(-1)  # (batch * depth_seq_len)
 
         # Compute cross-entropy loss for this depth
@@ -262,12 +265,13 @@ def train(model: nn.Module, mtp_predictor: nn.Module, optimizer: torch.optim.Opt
             # Get main model representations (before final LM head)
             # We need to recompute to get intermediate representations
             # Access the original uncompiled model if compiled
-            original_model = model._orig_mod if hasattr(model, '_orig_mod') else model
+            original_model = model._orig_mod if hasattr(
+                model, '_orig_mod') else model
 
             x = original_model.token_embeddings(inputs)
             residual = None
             for block in original_model.layers:
-                x, residual = block(x, residual, start_pos=0, mask=None)
+                x, residual = block(x, residual, mask=None)
             # Apply final norm
             x, _ = original_model.final_norm(x, residual)
             h_main = x  # (batch, seq_len, d_model)
@@ -295,7 +299,8 @@ def train(model: nn.Module, mtp_predictor: nn.Module, optimizer: torch.optim.Opt
     # =========================================
     # Backward pass with gradient accumulation
     # =========================================
-    if accumulation_step == 0: optimizer.zero_grad(set_to_none=True)
+    if accumulation_step == 0:
+        optimizer.zero_grad(set_to_none=True)
 
     total_loss.backward()
 
@@ -317,9 +322,12 @@ def train(model: nn.Module, mtp_predictor: nn.Module, optimizer: torch.optim.Opt
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Train Transformer Language Model with MTP')
-    parser.add_argument('--config', type=str, required=True, help='Path to config JSON file')
-    parser.add_argument('--resume', type=str, default=None, help='Path to checkpoint to resume from')
+    parser = argparse.ArgumentParser(
+        description='Train Transformer Language Model with MTP')
+    parser.add_argument('--config', type=str, required=True,
+                        help='Path to config JSON file')
+    parser.add_argument('--resume', type=str, default=None,
+                        help='Path to checkpoint to resume from')
     parser.add_argument('--gradient_accumulation_steps', type=int, default=1,
                         help='Number of gradient accumulation steps to simulate larger batch size')
     args = parser.parse_args()
@@ -345,7 +353,8 @@ def main():
     # Create extended config with gradient accumulation info for wandb
     wandb_config = config.copy()
     wandb_config['gradient_accumulation_steps'] = args.gradient_accumulation_steps
-    wandb_config['effective_batch_size'] = config['batch_size'] * args.gradient_accumulation_steps
+    wandb_config['effective_batch_size'] = config['batch_size'] * \
+        args.gradient_accumulation_steps
 
     wandb.init(
         project="Transformer_LLM",
@@ -440,7 +449,8 @@ def main():
 
     # count the trainable parameters of current model
     total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    trainable_params = sum(p.numel()
+                           for p in model.parameters() if p.requires_grad)
     print(f"Total parameters: {total_params:,}")
     print(f"Trainable parameters: {trainable_params:,}")
 
@@ -523,8 +533,10 @@ def main():
     with open(record_file_path, 'w') as record_file:
         record_file.write(f"Training Record for {config['dataset']}\n")
         record_file.write("=" * 80 + "\n")
-        record_file.write(f"Model: {config.get('run_name', 'transformer_training')}\n")
-        record_file.write(f"Started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        record_file.write(
+            f"Model: {config.get('run_name', 'transformer_training')}\n")
+        record_file.write(
+            f"Started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
         record_file.write(f"Config file: {args.config}\n")
         record_file.write("=" * 80 + "\n\n")
 
@@ -537,10 +549,12 @@ def main():
         # Write model architecture summary
         record_file.write("MODEL ARCHITECTURE:\n")
         record_file.write("-" * 80 + "\n")
-        record_file.write(f"ATT Type: [{attention_type}]   MLP Type: [{mlp_type}]\n")
+        record_file.write(
+            f"ATT Type: [{attention_type}]   MLP Type: [{mlp_type}]\n")
         record_file.write(f"Total parameters: {total_params:,}\n")
         record_file.write(f"Trainable parameters: {trainable_params:,}\n")
-        record_file.write(f"Gradient Accumulation Steps: {gradient_accumulation_steps}\n")
+        record_file.write(
+            f"Gradient Accumulation Steps: {gradient_accumulation_steps}\n")
         record_file.write(f"Micro Batch Size: {config['batch_size']}\n")
         record_file.write(f"Effective Batch Size: {effective_batch_size}\n")
         record_file.write("-" * 80 + "\n\n")
@@ -627,7 +641,6 @@ def main():
             with open(record_file_path, 'a') as record_file:
                 record_file.write(f"[TRAIN] {content}\n")
 
-
             # Log to wandb
             log_dict = {
                 'train/loss': avg_loss,
@@ -649,7 +662,8 @@ def main():
         # Validation and checkpointing
         if (iteration + 1) % config['eval_interval'] == 0:
             print("Running validation...")
-            val_loss, val_perplexity = valid(model, valid_loader, config, device)
+            val_loss, val_perplexity = valid(
+                model, valid_loader, config, device)
 
             val_content = f"Validation | Loss: {val_loss:.4f} | PPL: {val_perplexity:.2f}"
             print(val_content)
@@ -665,8 +679,10 @@ def main():
             }, step=iteration + 1)
 
             # Save checkpoint
-            checkpoint_path = checkpoint_dir / f"checkpoint_iter_{iteration + 1:06d}.pt"
-            save_checkpoint(model, optimizer, iteration + 1, str(checkpoint_path))
+            checkpoint_path = checkpoint_dir / \
+                f"checkpoint_iter_{iteration + 1:06d}.pt"
+            save_checkpoint(model, optimizer, iteration +
+                            1, str(checkpoint_path))
             print(f"Saved checkpoint: {checkpoint_path}")
 
             # Save best model
@@ -674,7 +690,8 @@ def main():
                 best_val_loss = val_loss
                 best_val_ppl = val_perplexity
                 best_checkpoint_path = checkpoint_dir / "best_model.pt"
-                save_checkpoint(model, optimizer, iteration + 1, str(best_checkpoint_path))
+                save_checkpoint(model, optimizer, iteration +
+                                1, str(best_checkpoint_path))
                 best_model_content = f"New best model saved: {best_checkpoint_path} (val_loss: {val_loss:.4f}, PPL: {val_perplexity:.2f})"
                 print(best_model_content)
 
@@ -695,17 +712,21 @@ def main():
     # Save training completion info to record file
     with open(record_file_path, 'a') as record_file:
         record_file.write(f"\n{'='*50}\n")
-        record_file.write(f"Training completed at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        record_file.write(
+            f"Training completed at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
         record_file.write(f"Total iterations: {config['max_iterations']}\n")
-        record_file.write(f"Final validation loss: {best_val_loss:.4f}   Final PPL: {best_val_ppl:.2f}\n")
+        record_file.write(
+            f"Final validation loss: {best_val_loss:.4f}   Final PPL: {best_val_ppl:.2f}\n")
         record_file.write(f"{'='*50}\n")
 
     # Print final results
-    print(f"\nFinal validation loss: {best_val_loss:.4f}   Final PPL: {best_val_ppl:.2f}")
+    print(
+        f"\nFinal validation loss: {best_val_loss:.4f}   Final PPL: {best_val_ppl:.2f}")
 
     # Save final checkpoint
     final_checkpoint_path = checkpoint_dir / "final_model.pt"
-    save_checkpoint(model, optimizer, config['max_iterations'], str(final_checkpoint_path))
+    save_checkpoint(model, optimizer,
+                    config['max_iterations'], str(final_checkpoint_path))
     final_checkpoint_content = f"Final checkpoint saved: {final_checkpoint_path}"
     print(final_checkpoint_content)
 

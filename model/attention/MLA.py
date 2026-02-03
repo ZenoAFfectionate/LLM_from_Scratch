@@ -84,21 +84,20 @@ class MultiHeadLatentAttention(nn.Module):
         self.output_proj = nn.Linear(
             head_num*self.head_dim, d_model, device=device, dtype=dtype)
 
-    def forward(self, x: torch.Tensor, start_pos: int = 0, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Forward pass for training mode.
 
         Args:
             x: Input tensor of shape (batch_size, seq_len, d_model)
-            start_pos: Starting position for RoPE
             mask: Optional attention mask
 
         Returns:
             output: Output tensor with same shape as input
         """
         batch, seq_len, _ = x.shape
-        token_positions = torch.arange(
-            start_pos, start_pos + seq_len, device=x.device)
+        # Generate token positions (always starting from 0 for training)
+        token_positions = torch.arange(seq_len, device=x.device)
 
         # =========
         # Process Q

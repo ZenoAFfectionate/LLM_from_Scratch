@@ -2,12 +2,12 @@ import atexit
 import torch.distributed as dist
 import time
 import torch.multiprocessing as mp
+from typing import Optional, Any
 
 from engine.sequence import Sequence
 from engine.scheduler import Scheduler
 from engine.model_runner import ModelRunner
 from utils.sampler import SamplingParams
-from transformers import AutoTokenizer
 
 
 def worker_process(config, rank, event):
@@ -28,7 +28,14 @@ class LLMEngine:
     LLM Engine that manages multiple processes for model inference.
     """
 
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, tokenizer: Optional[Any] = None):
+        """
+        初始化 LLM 推理引擎。
+
+        Args:
+            config: 引擎配置字典
+            tokenizer: 可选的自定义 tokenizer 实例，如果不提供则尝试使用 HuggingFace AutoTokenizer
+        """
         # initialize scheduler
         self.scheduler = Scheduler(
             max_num_sequences=config.get("max_num_sequences", 16),
@@ -52,8 +59,14 @@ class LLMEngine:
             process.start()
         # start the engine only on the master thread with rank = 0
         self.model_runner = ModelRunner(config, rank=0, event=self.events)
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            config.get("model_name_or_path", "gpt2"))
+        
+        # 使用自定义 tokenizer 或 HuggingFace tokenizer
+        if tokenizer is not None:
+            self.tokenizer = tokenizer
+        else:
+            from transformers import AutoTokenizer
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                config.get("model_name_or_path", "gpt2"))
         atexit.register(self.exit)
 
     def exit(self):

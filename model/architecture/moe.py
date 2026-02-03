@@ -18,8 +18,7 @@ class Gate(nn.Module):
         num_experts_per_tok: int,
         bias_update_speed: float = 0.01,
         aux_seq_loss_alpha: float = 0.01,
-        device=None,
-        dtype=None
+        device=None
     ):
         super().__init__()
         # parameters for MoE gating
@@ -29,70 +28,36 @@ class Gate(nn.Module):
         # parameters for load balancing
         self.seq_alpha = aux_seq_loss_alpha
         self.bias_update_speed = bias_update_speed
-
-        # [OPT] expert_bias is kept in fp32 for precision during updates
-        # We cache a converted version to avoid per-forward dtype conversion
-        self.register_buffer('expert_bias', torch.zeros(
-            self.n_routed_experts, device=device, dtype=torch.float32))
-        self.register_buffer('expert_load', torch.zeros(
-            self.n_routed_experts, device=device, dtype=torch.long))
-        # [OPT] Cache for converted bias - lazily populated on first forward
-        self._cached_bias_dtype = None
-        self._cached_bias = None
-
         # initialize gating weights for affinity score calculation
-        self.weight = nn.Parameter(torch.empty(
-            (self.n_routed_experts, self.hidden_size), device=device, dtype=dtype))
+        self.weight = nn.Parameter(torch.empty((self.n_routed_experts, self.hidden_size)))
         self.reset_parameters()
+        self.register_buffer('expert_load', torch.zeros(self.n_routed_experts, device=device, dtype=torch.long))
+        self.register_buffer('expert_bias', torch.zeros(self.n_routed_experts, device=device, dtype=torch.float32))
 
     def reset_parameters(self) -> None:
         import torch.nn.init as init
         init.kaiming_uniform_(self.weight, a=math.sqrt(5))
-        # Invalidate cache when parameters are reset
-        self._cached_bias_dtype = None
-        self._cached_bias = None
-
-    def _get_bias_in_dtype(self, target_dtype: torch.dtype) -> torch.Tensor:
-        """Get expert_bias in the target dtype, using cache to avoid repeated conversions.
-
-        [OPT] During training, bias changes after each step via update_bias().
-        During inference, bias is constant. The cache avoids repeated .to() calls.
-        """
-        if self._cached_bias_dtype != target_dtype or self._cached_bias is None:
-            self._cached_bias = self.expert_bias.to(target_dtype)
-            self._cached_bias_dtype = target_dtype
-        return self._cached_bias
 
     def forward(self, x):
         """ Forward pass with auxiliary-loss-free load balancing """
         bsz, seq_len, _ = x.shape
 
+        # compute expert logits and scores
         x_flat = x.view(-1, x.shape[-1])
-        # calculate affinity scores for each expert
         logits = x_flat @ self.weight.t()
         scores = torch.sigmoid(logits)
-
-        # [OPT] Use cached bias conversion to avoid repeated .to() calls
-        # The cache is invalidated when update_bias() is called
-        if self.expert_bias.dtype == logits.dtype:
-            biased_logits = logits + self.expert_bias.unsqueeze(0)
-        else:
-            biased_logits = logits + \
-                self._get_bias_in_dtype(logits.dtype).unsqueeze(0)
+        biased_scores = logits + self.expert_bias
 
         # select top-k experts based on biased logits and their unbiased weights
-        _, topk_indices = torch.topk(
-            biased_logits, k=self.top_k, dim=-1, sorted=False)
+        _, topk_indices = torch.topk(biased_scores, k=self.top_k, dim=-1, sorted=False)
         topk_weights = torch.gather(scores, dim=-1, index=topk_indices)
         if self.top_k > 1:  # re-normalize the weights of the selected
             denominator = topk_weights.sum(dim=-1, keepdim=True) + 1e-10
             topk_weights = topk_weights / denominator
 
-        # compute expert_load ONCE here, reuse to avoid duplicate
-        # [OPT] Use one_hot + sum instead of bincount - faster for small n_routed_experts
+        # Use one_hot + sum instead of bincount - faster for small n_routed_experts
         expert_token_counts = None
         if self.training:
-            # one_hot creates (N, n_experts) then sum along dim=0 gives counts per expert
             expert_token_counts = F.one_hot(
                 topk_indices.flatten(),
                 num_classes=self.n_routed_experts
@@ -135,14 +100,11 @@ class Gate(nn.Module):
 
         # Compute f_i directly with int64 sum, then convert to float at the end
         expert_counts = expert_mask.sum(dim=1)  # (bsz, n_experts)
-        f_i = expert_counts.to(scores.dtype) / \
-            (self.top_k * seq_len)  # (bsz, n_experts)
+        f_i = expert_counts.to(scores.dtype) / (self.top_k * seq_len)  # (bsz, n_experts)
 
         # vectorized P_i calculation: (bsz, n_experts):
-        score_sums = scores_reshaped.sum(
-            dim=2, keepdim=True)       # (bsz, seq_len, 1)
-        normalized_scores = scores_reshaped / \
-            (score_sums + 1e-10)  # (bsz, seq_len, n_experts)
+        score_sums = scores_reshaped.sum(dim=2, keepdim=True)       # (bsz, seq_len, 1)
+        normalized_scores = scores_reshaped / (score_sums + 1e-10)  # (bsz, seq_len, n_experts)
         P_i = normalized_scores.mean(dim=1)  # (bsz, n_experts)
 
         seq_losses = (f_i * P_i).sum(dim=1)  # (bsz,)
@@ -154,21 +116,14 @@ class Gate(nn.Module):
         """
         Update expert bias vectorized based on load balance.
         Should be called at the end of each training step.
-
-        Args:
-            total_tokens: Total number of tokens processed in the batch
         """
-        if not self.training:
-            return
-        # calculate expected load per expert (uniform distribution)
-        expected_load = (total_tokens * self.top_k) / self.n_routed_experts
-        # vectorized bias update: compute difference and update all biases at once
-        load_diff = self.expert_load.float() - expected_load
-        self.expert_bias -= torch.sign(load_diff) * self.bias_update_speed
-
-        # [OPT] Invalidate cached bias since we just updated it
-        self._cached_bias_dtype = None
-        self._cached_bias = None
+        if not self.training: return
+        with torch.no_grad():
+            # calculate expected load per expert (uniform distribution)
+            expected_load = (total_tokens * self.top_k) / self.n_routed_experts
+            # vectorized bias update: compute difference and update all biases at once
+            load_diff = self.expert_load.float() - expected_load
+            self.expert_bias -= torch.sign(load_diff) * self.bias_update_speed
 
 
 class MOE(nn.Module):
@@ -208,7 +163,6 @@ class MOE(nn.Module):
             aux_seq_loss_alpha=aux_seq_loss_alpha,
             bias_update_speed=bias_update_speed,
             device=device,
-            dtype=dtype
         )
         # Initialize shared expert (single MLP)
         if n_shared_experts > 0:

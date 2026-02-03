@@ -75,6 +75,15 @@ class Config:
         max_grad_norm: Maximum gradient norm for clipping (default: 1.0)
         use_amp: Whether to use automatic mixed precision (default: True)
 
+    Optimizer Configuration:
+        optimizer: Optimizer type ("muon" or "adamw", default: "muon")
+        muon_lr: Muon learning rate (default: 0.02)
+        muon_min_lr: Muon minimum learning rate (default: 0.002)
+        muon_momentum: Muon momentum coefficient (default: 0.95)
+        muon_nesterov: Whether to use Nesterov momentum in Muon (default: True)
+        muon_ns_steps: Number of Newton-Schulz iterations in Muon (default: 5)
+        muon_weight_decay: Weight decay for Muon parameters (default: 0.0)
+
     Data Configuration:
         dataset: Dataset name (default: "OpenWebText")
         data_dir: Directory containing the data (default: "./data/OpenWebText")
@@ -147,6 +156,15 @@ class Config:
         max_grad_norm: float = 1.0,
         use_amp: bool = True,
 
+        # Optimizer configuration
+        optimizer: str = "muon",
+        muon_lr: float = 0.02,
+        muon_min_lr: float = 0.002,
+        muon_momentum: float = 0.95,
+        muon_nesterov: bool = True,
+        muon_ns_steps: int = 5,
+        muon_weight_decay: float = 0.0,
+
         # Data configuration
         dataset: str = "OpenWebText",
         data_dir: str = "./data/OpenWebText",
@@ -201,11 +219,13 @@ class Config:
 
         # Engram configuration
         self.use_engram = use_engram
-        self.engram_layer_ids = engram_layer_ids if engram_layer_ids is not None else [1, 5]
+        self.engram_layer_ids = engram_layer_ids if engram_layer_ids is not None else [
+            1, 5]
         self.engram_max_ngram_size = engram_max_ngram_size
         self.engram_n_embed_per_ngram = engram_n_embed_per_ngram
         self.engram_n_head_per_ngram = engram_n_head_per_ngram
-        self.engram_vocab_size = engram_vocab_size if engram_vocab_size is not None else [10007, 10009]
+        self.engram_vocab_size = engram_vocab_size if engram_vocab_size is not None else [
+            10007, 10009]
         self.engram_kernel_size = engram_kernel_size
         self.engram_pad_id = engram_pad_id
         self.engram_tokenizer_path = engram_tokenizer_path
@@ -224,12 +244,22 @@ class Config:
         self.max_grad_norm = max_grad_norm
         self.use_amp = use_amp
 
+        # Optimizer configuration
+        self.optimizer = optimizer.lower()  # normalize to lowercase
+        self.muon_lr = muon_lr
+        self.muon_min_lr = muon_min_lr
+        self.muon_momentum = muon_momentum
+        self.muon_nesterov = muon_nesterov
+        self.muon_ns_steps = muon_ns_steps
+        self.muon_weight_decay = muon_weight_decay
+
         # Data configuration
         self.dataset = dataset
         self.data_dir = data_dir
         self.vocab_file = vocab_file
         self.merges_file = merges_file
-        self.special_tokens = special_tokens if special_tokens is not None else ["<|endoftext|>"]
+        self.special_tokens = special_tokens if special_tokens is not None else [
+            "<|endoftext|>"]
 
         # Logging and checkpointing
         self.run_name = run_name

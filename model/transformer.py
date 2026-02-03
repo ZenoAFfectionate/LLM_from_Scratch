@@ -83,14 +83,16 @@ class Block(nn.Module):
                 dtype=dtype
             )
         else:
-            self.ffn = MLP(config.d_model, config.d_ff, device=device, dtype=dtype)
+            self.ffn = MLP(config.d_model, config.d_ff,
+                           device=device, dtype=dtype)
 
         # RMSNorm always uses FP32 weights (handled internally)
         self.att_norm = RMSNorm(config.d_model, device=device)
         self.ffn_norm = RMSNorm(config.d_model, device=device)
-        self.dropout = nn.Dropout(config.dropout) if config.dropout else nn.Identity()
+        self.dropout = nn.Dropout(
+            config.dropout) if config.dropout else nn.Identity()
 
-    def forward(self, x: torch.Tensor, residual: torch.Tensor, start_pos: int = 0,
+    def forward(self, x: torch.Tensor, residual: torch.Tensor,
                 mask: torch.Tensor = None) -> torch.Tensor:
         """
         Forward pass with Fused Add & Norm optimization.
@@ -98,7 +100,6 @@ class Block(nn.Module):
         Args:
             x: input tensor
             residual: residual tensor from previous layer (or None for first layer)
-            start_pos: starting position for RoPE and KV cache
             mask: optional causal attention mask (shared across all layers)
 
         Returns:
@@ -110,11 +111,11 @@ class Block(nn.Module):
             x, residual = self.att_norm(x), x
         else:
             x, residual = self.att_norm(x, residual)
-        
+
         if self.attention_type == "DSA":
-            x, _ = self.att(x, start_pos, mask, use_sparse=True)
+            x, _ = self.att(x, mask, use_sparse=True)
         else:
-            x = self.att(x, start_pos, mask)
+            x = self.att(x, mask)
         x = self.dropout(x)
 
         # Fused Add & Norm for FFN
@@ -144,10 +145,12 @@ class TransformerLM(nn.Module):
         self.context_length = config.context_length
 
         # Model weights are always FP32 for stability. Mixed precision only affects forward pass via autocast.
-        self.token_embeddings = Embedding(config.vocab_size, config.d_model, device=device, dtype=dtype)
-        
+        self.token_embeddings = Embedding(
+            config.vocab_size, config.d_model, device=device, dtype=dtype)
+
         rope_dim = config.d_model // config.num_heads
-        if config.attention_type in ("MLA", "DSA"): rope_dim = config.rope_dim
+        if config.attention_type in ("MLA", "DSA"):
+            rope_dim = config.rope_dim
         self.rope = RotaryPositionalEmbedding(
             config.rope_theta,
             rope_dim,
@@ -160,16 +163,18 @@ class TransformerLM(nn.Module):
             Block(
                 config=config,
                 rope=self.rope,
-                use_moe=(config.use_moe and (config.moe_layers is None or i in config.moe_layers)),
+                use_moe=(config.use_moe and (
+                    config.moe_layers is None or i in config.moe_layers)),
                 device=device,
                 dtype=dtype
             )
             for i in range(config.num_layers)
         ])
         self.final_norm = RMSNorm(config.d_model, device=device)
-        self.lm_head = nn.Linear(config.d_model, config.vocab_size, device=device, dtype=dtype)
+        self.lm_head = nn.Linear(
+            config.d_model, config.vocab_size, device=device, dtype=dtype)
 
-    def forward(self, x: torch.Tensor, start_pos: int = 0):
+    def forward(self, x: torch.Tensor):
         """
         Forward pass through the transformer language model with Fused Add & Norm.
 
@@ -182,12 +187,14 @@ class TransformerLM(nn.Module):
         x = self.token_embeddings(x)  # apply token embedding
 
         mask = None
-        if seq_len > 1:  # construct boolean causal mask once for training (True means allowed)
-            mask = torch.tril(torch.ones((seq_len, seq_len), device=x.device, dtype=torch.bool))
+        # construct boolean causal mask once for training (True means allowed)
+        if seq_len > 1:
+            mask = torch.tril(torch.ones((seq_len, seq_len),
+                              device=x.device, dtype=torch.bool))
 
         residual = None
         for block in self.layers:
-            x, residual = block(x, residual, start_pos, mask)
+            x, residual = block(x, residual, mask)
 
         x, _ = self.final_norm(x, residual)
         return self.lm_head(x)  # model token probability distribution
@@ -196,6 +203,7 @@ class TransformerLM(nn.Module):
         """Update expert biases for all MoE layers (auxiliary-loss-free load balancing)"""
         if not self.use_moe:
             return
+
         for layer in self.layers:
             if hasattr(layer, 'use_moe') and layer.use_moe:
                 if hasattr(layer.ffn, 'update_expert_bias'):

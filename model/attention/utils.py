@@ -913,10 +913,9 @@ def paged_attention_decode(
     return output
 
 
-# =============================================================================
+# ======================================================================
 # Kernel: MLA Store Cache - Store compressed KV and RoPE to paged cache
-# =============================================================================
-
+# ======================================================================
 @triton.jit
 def _store_mla_cache_kernel(
     kv_ptr,           # Input kv_compressed tensor pointer

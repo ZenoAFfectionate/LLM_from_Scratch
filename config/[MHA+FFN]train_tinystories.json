@@ -19,6 +19,7 @@
     "attention_type": "MHA",
     "rope_theta": 10000.0,
     "optimizer": "muon",
+    "use_moe": false,
     "muon_lr": 0.02,
     "muon_min_lr": 0.002,
     "muon_momentum": 0.95,

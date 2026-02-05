@@ -1,6 +1,7 @@
 import os
 import time
 import json
+import heapq
 import regex as re
 from tqdm import tqdm
 import multiprocessing
@@ -11,6 +12,8 @@ from typing import Iterable, Iterator
 from typing import BinaryIO, Dict, List, Tuple
 
 
+# GPT-2 pre-tokenization regex pattern (compiled once for performance)
+# Matches: contractions, words (with optional leading space), numbers, punctuation, whitespace
 PAT = re.compile(r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
 
 
@@ -154,8 +157,10 @@ def train_bpe(
     num_workers = multiprocessing.cpu_count()
     word_dicts: List[Dict[Tuple[bytes, ...], int]] = []
         
+    # Use the first special token as chunk delimiter, fallback to newline
+    split_token = special_tokens[0].encode('utf-8') if special_tokens else b'\n'
     with open(input_path, "rb") as f:
-        boundaries = find_chunk_boundaries(f, num_workers, b"<|endoftext|>")
+        boundaries = find_chunk_boundaries(f, num_workers, split_token)
         chunk_args = []
         for start, end in zip(boundaries[:-1], boundaries[1:]):
             if start < end:  # skip empty chunks
@@ -185,13 +190,38 @@ def train_bpe(
             pair_cnt[pair] += cnt
             pair_to_words[pair].add(word_bytes)
 
+    class MaxHeapItem:
+        ''' for max-heap behavior with correct tie-breaking'''
+        __slots__ = ('count', 'pair')
+        def __init__(self, count: int, pair: Tuple[bytes, bytes]):
+            self.count = count
+            self.pair = pair
+        
+        def __lt__(self, other):
+            # higher count first, then larger pair
+            if self.count != other.count:
+                return self.count > other.count
+            return self.pair > other.pair
+    
+    pair_heap: List[MaxHeapItem] = []
+    for pair, cnt in pair_cnt.items():
+        heapq.heappush(pair_heap, MaxHeapItem(cnt, pair))
+
     pbar = tqdm(total=vocab_size - base_vocab_size, desc="BPE Merges")
 
     for i in range(vocab_size - base_vocab_size):
         if not pair_cnt: break  # no more pairs to merge
 
-        # find the most frequent pair, use pair key to break ties deterministically
-        max_pair = max(pair_cnt.items(), key=lambda x: (x[1], x[0]))[0]
+        # pop from heap until we find a valid entry
+        max_pair = None
+        while pair_heap:
+            item = heapq.heappop(pair_heap)
+            # verify this entry is still valid (lazy deletion)
+            if item.pair in pair_cnt and pair_cnt[item.pair] == item.count:
+                max_pair = item.pair
+                break
+        
+        if max_pair is None: break  # no valid pairs left
 
         # new token id and value
         token_id = base_vocab_size + i
@@ -200,14 +230,14 @@ def train_bpe(
         vocab[token_id] = token_value
         merges.append(max_pair)
 
-        # Get words that contain the pair to merge from the index
+        # get words that contain the pair to merge from the index
         affected_words = pair_to_words[max_pair]
         new_word_cnt: Dict[Tuple[bytes, ...], int] = {}
         
-        updated_pairs = set()  # pairs that need their counts updated
+        pairs_modified: set = set()  # pairs that need to be re-pushed to heap
         
-        # Process all words in a single pass (sorted for determinism)
-        for word_bytes in sorted(word_cnt.keys()):
+        # process all words in a single pass (sorted for determinism)
+        for word_bytes in word_cnt.keys():
             cnt = word_cnt[word_bytes]
             # only process words that contain the pair
             if word_bytes in affected_words:
@@ -219,7 +249,8 @@ def train_bpe(
                     if pair_cnt[pair] == 0:
                         del pair_cnt[pair]
                         del pair_to_words[pair]
-                    updated_pairs.add(pair)
+                    else:
+                        pairs_modified.add(pair)  # count changed, need to re-push
 
                 # create new word with merged token
                 new_word_list: List[bytes] = []
@@ -242,10 +273,15 @@ def train_bpe(
                         pair_to_words[pair] = set()
                     pair_cnt[pair] += cnt
                     pair_to_words[pair].add(new_word)
-                    updated_pairs.add(pair)
+                    pairs_modified.add(pair)  # new or modified pair
             else:
                 # copy unaffected word as-is
                 new_word_cnt[word_bytes] = cnt
+
+        # push all modified pairs to heap with their current counts
+        for pair in pairs_modified:
+            if pair in pair_cnt:
+                heapq.heappush(pair_heap, MaxHeapItem(pair_cnt[pair], pair))
 
         # update for next iteration
         word_cnt = new_word_cnt
@@ -333,42 +369,97 @@ class Tokenizer:
 
 
     def _bpe_merge(self, word_bytes: bytes) -> list[int]:
-        ''' Applies the BPE merge rules to a single pre-token (word) '''
-        # check cache first for speed
+        """
+        Applies the BPE merge rules to a single pre-token (word).
+        
+        Uses a heap-based approach for O(n log n) complexity instead of O(n²).
+        - Doubly-linked list represents tokens (prev/next arrays)
+        - Min-heap tracks pairs by merge priority (rank)
+        - Lazy deletion handles invalidated pairs
+        """
+        # Check cache first for speed
         if word_bytes in self.bpe_cache:
             return self.bpe_cache[word_bytes]
         
-        word = [bytes([b]) for b in word_bytes]  # list of single-byte bytes
-
-        if len(word) == 1:  # single byte, no merges possible
-            res_ids = [self.encoder_vocab[b''.join(word)]]
+        n = len(word_bytes)
+        if n == 0:
+            return []
+        
+        if n == 1:
+            res_ids = [self.encoder_vocab.get(word_bytes, word_bytes[0])]
             self.bpe_cache[word_bytes] = res_ids
             return res_ids
 
-        # In-place merging loop (fast)
-        while True:
-            best_i = -1
-            best_rank = float('inf')
-            # find best adjacent pair
-            for i in range(len(word) - 1):
-                rank = self.merges.get((word[i], word[i + 1]))
-                if rank is not None and rank < best_rank:
-                    best_rank = rank
-                    best_i = i
-            if best_i < 0: break
-            # merge at best_i in place
-            word[best_i:best_i + 2] = [word[best_i] + word[best_i + 1]]
+        # Initialize tokens as single bytes
+        tokens = [bytes([b]) for b in word_bytes]
+        
+        # Doubly-linked list: prev[i] = previous index, next[i] = next index
+        # -1 means no predecessor/successor
+        prev_idx = [-1] + list(range(n - 1))  # prev_idx[i] = i-1, prev_idx[0] = -1
+        next_idx = list(range(1, n)) + [-1]   # next_idx[i] = i+1, next_idx[n-1] = -1
+        
+        # Build min-heap with (rank, position, l_token, r_token)
+        # use lazy deletion: verify tokens match when popping
+        heap = []
+        for i in range(n - 1):
+            pair = (tokens[i], tokens[i + 1])
+            rank = self.merges.get(pair)
+            if rank is not None:
+                heapq.heappush(heap, (rank, i, tokens[i], tokens[i + 1]))
+        
+        # Process merges using heap
+        while heap:
+            rank, pos, left_tok, right_tok = heapq.heappop(heap)
+            
+            # Skip if this entry is stale (tokens changed or position invalidated)
+            if tokens[pos] is None: 
+                continue
+            right_pos = next_idx[pos]
+            if right_pos == -1 or tokens[right_pos] is None:
+                continue
+            if tokens[pos] != left_tok or tokens[right_pos] != right_tok:
+                continue
+            
+            # Merge: combine tokens at pos and right_pos
+            merged_token = left_tok + right_tok
+            tokens[pos] = merged_token
+            tokens[right_pos] = None  # Mark as deleted
+            
+            # Update linked list: skip over right_pos
+            new_next = next_idx[right_pos]
+            next_idx[pos] = new_next
+            if new_next != -1:
+                prev_idx[new_next] = pos
+            
+            # Add new pairs to heap if they have valid merges
+            # Left pair: (prev_idx[pos], pos)
+            left_neighbor = prev_idx[pos]
+            if left_neighbor != -1 and tokens[left_neighbor] is not None:
+                pair = (tokens[left_neighbor], merged_token)
+                pair_rank = self.merges.get(pair)
+                if pair_rank is not None:
+                    heapq.heappush(heap, (pair_rank, left_neighbor, tokens[left_neighbor], merged_token))
+            
+            # Right pair: (pos, new_next)
+            if new_next != -1 and tokens[new_next] is not None:
+                pair = (merged_token, tokens[new_next])
+                pair_rank = self.merges.get(pair)
+                if pair_rank is not None:
+                    heapq.heappush(heap, (pair_rank, pos, merged_token, tokens[new_next]))
 
-        # convert the final merged tokens into IDs
+        # collect final tokens (skip None entries)
+        final_tokens = [t for t in tokens if t is not None]
+        
+        # Convert to token IDs
         ids = []
-        for token in word:
-            # look up the token ID, fall back to individual bytes if not found
+        for token in final_tokens:
             if token in self.encoder_vocab:
                 ids.append(self.encoder_vocab[token])
             else:
+                # Fallback: encode as individual bytes
                 ids.extend(self.encoder_vocab[bytes([byte])] for byte in token)
 
-        self.bpe_cache[word_bytes] = ids  # save to cache
+        self.bpe_cache[word_bytes] = ids
         return ids
 
 
@@ -489,5 +580,5 @@ if __name__ == "__main__":
         print(f"✅ Training for '{name}' completed in {duration:.2f} seconds.")
         
         # Save the trained vocabulary and merges
-        save_tokenizer_files(name, vocab, merges)
-        print("-" * 80 + "\n")
+        # save_tokenizer_files(name, vocab, merges)
+        # print("-" * 80 + "\n")

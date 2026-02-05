@@ -55,7 +55,7 @@ class Gate(nn.Module):
             denominator = topk_weights.sum(dim=-1, keepdim=True) + 1e-10
             topk_weights = topk_weights / denominator
 
-        # Use one_hot + sum instead of bincount - faster for small n_routed_experts
+        # use one_hot + sum instead of bincount - faster for small n_routed_experts
         expert_token_counts = None
         if self.training:
             expert_token_counts = F.one_hot(
@@ -87,18 +87,15 @@ class Gate(nn.Module):
         - P_i: average of normalized routing probabilities for expert i (eq. 19-20)
         - α: small hyperparameter weight (seq_alpha)
         """
-        scores_reshaped = scores.view(
-            bsz, seq_len, self.n_routed_experts)  # (bsz, seq_len, n_experts)
-        topk_idx_reshaped = topk_idx.view(
-            bsz, seq_len, self.top_k)         # (bsz, seq_len, top_k)
+        scores_reshaped = scores.view(bsz, seq_len, self.n_routed_experts)  # (bsz, seq_len, n_experts)
+        topk_idx_reshaped = topk_idx.view(bsz, seq_len, self.top_k)         # (bsz, seq_len, top_k)
 
-        # Use F.one_hot - output is already float when scores is float
         expert_mask = F.one_hot(
             topk_idx_reshaped.view(bsz, -1),  # (bsz, seq_len*top_k)
             num_classes=self.n_routed_experts
         )  # (bsz, seq_len*top_k, n_experts), dtype=int64
 
-        # Compute f_i directly with int64 sum, then convert to float at the end
+        # compute f_i directly with int64 sum, then convert to float at the end
         expert_counts = expert_mask.sum(dim=1)  # (bsz, n_experts)
         f_i = expert_counts.to(scores.dtype) / (self.top_k * seq_len)  # (bsz, n_experts)
 
@@ -201,31 +198,24 @@ class MOE(nn.Module):
             sorted_expert_idx = torch.argsort(flat_topk_idx)
             sorted_token_idx = token_indices[sorted_expert_idx]
             sorted_weight = flat_topk_weight[sorted_expert_idx]
+            sorted_tokens = x_flat[sorted_token_idx]  # permute tokens to match expert group
 
-            # permute tokens to match expert group for contiguous memory access
-            sorted_tokens = x_flat[sorted_token_idx]
-
-            # Reuse expert_token_counts from Gate - single sync point here
-            # Convert counts to list ONCE for torch.split and loop bounds
+            # reuse expert_token_counts from Gate - sync here
             expert_counts_list = expert_token_counts.tolist()
-
-            # Split sorted_tokens into chunks by expert (no additional sync needed)
-            # torch.split returns a tuple of tensors, one per expert
+            # split sorted_tokens into chunks by expert
             expert_inputs = torch.split(sorted_tokens, expert_counts_list)
 
-            # Process each expert and collect outputs
+            # Process each expert and concatenate all outputs back
             expert_outputs = [
                 self.experts[expert_id](expert_inputs[expert_id])
                 for expert_id in range(self.n_routed_experts)
             ]
-
-            # Concatenate all outputs back together (same order as sorted_tokens)
             y_sorted = torch.cat(expert_outputs, dim=0)
 
             # Fused Triton kernel: weight multiplication + scatter-add using segment reduction
             # This is MUCH faster than atomic scatter-add because:
             #   1. Re-sorts by target token to enable contiguous segment access
-            #   2. Uses segment reduction (no atomics!) - each output token sums its segment
+            #   2. Uses segment reduction - each output token sums its segment
             #   3. Fully coalesced reads and writes
             y_flat = fused_scatter_add_weighted(
                 y_sorted,           # raw expert outputs
@@ -241,7 +231,7 @@ class MOE(nn.Module):
             y = self.moe_infer(x_flat, flat_topk_idx, topk_weight.view(-1, 1))
             y = y.view(batch_size, seq_len, -1)
 
-        # Apply shared expert and add to output
+        # apply shared expert and add to output
         if self.n_shared_experts > 0:
             y = y + self.shared_expert(identity)
 
@@ -270,50 +260,40 @@ class MOE(nn.Module):
         """
         expert_cache = torch.zeros_like(x)
 
-        # sort indices to group tokens by expert
+        # sort indices to group tokens by expert and count
         idxs = flat_expert_indices.argsort()
-
-        # Use one_hot + sum instead of bincount: faster for small n_experts
         counts = F.one_hot(
             flat_expert_indices,
             num_classes=self.n_routed_experts
         ).sum(dim=0)
 
-        # Single sync point - get counts as list for torch.split
-        counts_list = counts.tolist()
+        d_model = x.shape[-1]  # 
+        counts_list = counts.tolist()  # 
 
         token_idxs = idxs // self.num_experts_per_tok
 
-        # [OPT] Pre-convert weights to match x dtype once
+        # pre-convert weights to match x dtype once
         if flat_expert_weights.dtype != x.dtype:
             flat_expert_weights = flat_expert_weights.to(x.dtype)
 
-        # [OPT] Pre-compute d_model for index expansion
-        d_model = x.shape[-1]
-
-        # Split sorted indices into per-expert chunks
+        # split sorted indices into per-expert chunks
         token_idx_chunks = torch.split(token_idxs, counts_list)
         weight_idx_chunks = torch.split(idxs, counts_list)
 
         # loop through the batches of tokens for each expert
-        # [OPT] Remove data-dependent `if count == 0` check to avoid graph breaks
-        # All operations (indexing, expert forward, scatter_add_) handle empty tensors correctly
         for i in range(self.n_routed_experts):
             expert = self.experts[i]
             exp_token_idx = token_idx_chunks[i]
 
-            # get the batch of tokens for this expert (empty tensor if no tokens)
+            # get the batch of tokens for this expert
             expert_tokens = x[exp_token_idx]
-
-            # process the batch and weight the output (works with empty tensors)
+            # process the batch and weight the output
             expert_out = expert(expert_tokens)
 
-            # [OPT] weights already in correct dtype, no conversion needed
             weights = flat_expert_weights[weight_idx_chunks[i]]
             expert_out = expert_out * weights
 
-            # [OPT] Use expand instead of repeat for memory efficiency (no copy)
-            # scatter_add_ with empty indices is a no-op (correct behavior)
+            # use expand instead of repeat for memory efficiency (no copy)
             scatter_idx = exp_token_idx.unsqueeze(1).expand(-1, d_model)
             expert_cache.scatter_add_(0, scatter_idx, expert_out)
 

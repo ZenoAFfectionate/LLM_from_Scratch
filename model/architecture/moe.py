@@ -110,15 +110,11 @@ class Gate(nn.Module):
         return aux_seq_loss
 
     def update_bias(self, total_tokens):
-        """
-        Update expert bias vectorized based on load balance.
-        Should be called at the end of each training step.
-        """
         if not self.training: return
         with torch.no_grad():
             # calculate expected load per expert (uniform distribution)
             expected_load = (total_tokens * self.top_k) / self.n_routed_experts
-            # vectorized bias update: compute difference and update all biases at once
+            # vectorized bias update: compute difference and update at once
             load_diff = self.expert_load.float() - expected_load
             self.expert_bias -= torch.sign(load_diff) * self.bias_update_speed
 
@@ -148,7 +144,9 @@ class MOE(nn.Module):
         self.n_routed_experts = n_routed_experts
         self.num_experts_per_tok = num_experts_per_tok
         self.n_shared_experts = n_shared_experts
-        # initialize experts and gate
+        # ==========
+        # Modified: write efficient kernel for expert computation
+        # ==========
         self.experts = nn.ModuleList([
             MLP(d_model, d_ff, device=device, dtype=dtype)
             for _ in range(n_routed_experts)

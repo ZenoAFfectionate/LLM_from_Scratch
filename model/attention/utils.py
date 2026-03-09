@@ -14,6 +14,31 @@ import triton.language as tl
 from typing import Tuple, Optional
 
 
+# -------------------------------------------------------
+#  Utility: GPU-native varlen position computation
+# -------------------------------------------------------
+def compute_varlen_positions(cu_seqlens: torch.Tensor, total_tokens: int, device: torch.device) -> torch.Tensor:
+    """
+    Compute per-token within-sequence positions for variable-length sequences,
+    entirely on GPU without any CPU-GPU synchronization.
+
+    Given cu_seqlens = [0, 3, 7, 10], produces positions = [0, 1, 2, 0, 1, 2, 3, 0, 1, 2].
+
+    Uses the segment-boundary trick: mark where sequences start, cumsum to get
+    sequence IDs, gather start offsets, subtract to get local positions.
+    """
+    positions = torch.arange(total_tokens, device=device, dtype=torch.long)
+    # Mark sequence boundaries: set 1 at each sequence start (except the first)
+    seq_ids = torch.zeros(total_tokens, device=device, dtype=torch.long)
+    boundaries = cu_seqlens[1:-1].long()  # interior boundaries (skip 0 and total)
+    if boundaries.numel() > 0:
+        seq_ids[boundaries] = 1
+    seq_ids = seq_ids.cumsum(0)  # [0,0,0,1,1,1,1,2,2,2]
+    # Gather each token's sequence start offset and subtract
+    seq_starts = cu_seqlens[seq_ids].long()
+    return positions - seq_starts
+
+
 # ---------------------------------------
 #  Problem 5: Implement Softmax Function
 # ---------------------------------------

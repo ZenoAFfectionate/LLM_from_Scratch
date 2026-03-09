@@ -41,39 +41,39 @@ def silu(x: torch.Tensor) -> torch.Tensor:
     return x * torch.sigmoid(x)
 
 
-class MLP(nn.Module):
-    """ Special SwiGLU MLP network implementation with explicit FP32 computation for stability """
-    def __init__(self, d_model: int, d_ff: int = None, device=None, dtype=None):
-        super().__init__()
-        if d_ff is None: d_ff = 64 * ((int(d_model * 8 / 3) + 64 - 1) // 64)
-        # initialize three linear projection for SwiGLU:
-        # use BF16 for weights but computation uses FP32
-        self.w1 = nn.Linear(d_model, d_ff, device=device, dtype=dtype)  # shape: (d_ff, d_model)
-        self.w3 = nn.Linear(d_model, d_ff, device=device, dtype=dtype)  # shape: (d_ff, d_model)
-        self.w2 = nn.Linear(d_ff, d_model, device=device, dtype=dtype)  # shape: (d_model, d_ff)
-        # self.dropout = nn.Dropout(dropout=0.1)  # no need Dropout inside
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Let autocast handle dtype management automatically
-        w1_out = self.w1(x)
-        w3_out = self.w3(x)
-        activated = F.silu(w1_out) * w3_out  # use F.silu() here
-        return self.w2(activated)
-
-
 # class MLP(nn.Module):
-#     """Special SwiGLU MLP network with matrix fusion optimization."""
+#     """ Special SwiGLU MLP network implementation with explicit FP32 computation for stability """
 #     def __init__(self, d_model: int, d_ff: int = None, device=None, dtype=None):
 #         super().__init__()
 #         if d_ff is None: d_ff = 64 * ((int(d_model * 8 / 3) + 64 - 1) // 64)
 #         # initialize three linear projection for SwiGLU:
 #         # use BF16 for weights but computation uses FP32
-#         self.w1 = nn.Linear(d_model, d_ff*2, device=device, dtype=dtype)  # shape: (d_ff, 2*d_model)
-#         self.w2 = nn.Linear(d_ff, d_model, device=device, dtype=dtype)    # shape: (d_model, d_ff)
+#         self.w1 = nn.Linear(d_model, d_ff, device=device, dtype=dtype)  # shape: (d_ff, d_model)
+#         self.w3 = nn.Linear(d_model, d_ff, device=device, dtype=dtype)  # shape: (d_ff, d_model)
+#         self.w2 = nn.Linear(d_ff, d_model, device=device, dtype=dtype)  # shape: (d_model, d_ff)
 #         # self.dropout = nn.Dropout(dropout=0.1)  # no need Dropout inside
 
 #     def forward(self, x: torch.Tensor) -> torch.Tensor:
 #         # Let autocast handle dtype management automatically
-#         w1_out, w3_out = self.w1(x).chunk(2, dim=-1)
+#         w1_out = self.w1(x)
+#         w3_out = self.w3(x)
 #         activated = F.silu(w1_out) * w3_out  # use F.silu() here
 #         return self.w2(activated)
+
+
+class MLP(nn.Module):
+    """Special SwiGLU MLP network with matrix fusion optimization."""
+    def __init__(self, d_model: int, d_ff: int = None, device=None, dtype=None):
+        super().__init__()
+        if d_ff is None: d_ff = 64 * ((int(d_model * 8 / 3) + 64 - 1) // 64)
+        # initialize three linear projection for SwiGLU:
+        # use BF16 for weights but computation uses FP32
+        self.w1 = nn.Linear(d_model, d_ff*2, device=device, dtype=dtype)  # shape: (d_ff, 2*d_model)
+        self.w2 = nn.Linear(d_ff, d_model, device=device, dtype=dtype)    # shape: (d_model, d_ff)
+        # self.dropout = nn.Dropout(dropout=0.1)  # no need Dropout inside
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Let autocast handle dtype management automatically
+        w1_out, w3_out = self.w1(x).chunk(2, dim=-1)
+        activated = F.silu(w1_out) * w3_out  # use F.silu() here
+        return self.w2(activated)

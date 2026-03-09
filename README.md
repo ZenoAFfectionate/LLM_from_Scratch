@@ -693,9 +693,25 @@ def _store_mla_cache_kernel(kv_ptr, pe_ptr, kv_cache_ptr, pe_cache_ptr, slot_map
 
 
 
-### Experiment on Tinystories
+### Experiment on TinyStories
 
+All TinyStories experiments use an 8-layer Transformer with `d_model=512`, 16 attention heads, `d_ff=1344`, context length 512, batch size 128, and are trained for 10K iterations with the hybrid Muon+AdamW optimizer under mixed-precision training on a single RTX 4090. MoE variants use 4 routed experts with top-1 routing and 1 shared expert (applied to layers 1–7). GQA uses 4 KV heads (group size 4). MLA uses `q_lora_rank=128`, `kv_lora_rank=64`, and `rope_dim=8`.
 
+| Attention | Forward | **Loss** | **PPL** | **Iteration Time** |
+|-----------|---------|----------|---------|---------------------|
+| MHA       | FFN     | 0.4886   | 1.63    | 0.245s              |
+| MHA       | MoE     | 0.4887   | 1.63    | 0.275s              |
+| GQA       | FFN     | 0.4929   | 1.64    | 0.242s              |
+| GQA       | MoE     | 0.4942   | 1.64    | 0.275s              |
+| MLA       | MoE     | 0.4996   | 1.65    | 0.285s              |
+
+The most striking observation from the TinyStories experiments is the remarkably narrow performance spread across all architectural configurations: the loss ranges from 0.4886 to 0.4996, and perplexity varies only between 1.63 and 1.65. This near-uniform convergence strongly suggests that the TinyStories dataset—a synthetic corpus composed of simple children's stories with limited vocabulary and straightforward narrative patterns—presents a modeling task that is well within the capacity of even the simplest configuration tested. When the dataset complexity is low enough, additional architectural sophistication yields diminishing returns in final quality.
+
+The baseline MHA+FFN configuration achieves the best loss (0.4886) while maintaining an efficient iteration time of 0.245s, demonstrating that the classic Transformer architecture remains highly competitive on small-scale tasks. Replacing the dense FFN with MoE in the MHA+MoE variant leaves the loss virtually unchanged (0.4887) but introduces a 12% overhead in iteration time (0.275s vs. 0.245s). This overhead stems from the expert routing mechanism, gating computations, and the sort-based token dispatch, none of which provide meaningful benefit when the data distribution is simple enough for a single dense FFN to model effectively.
+
+GQA-based variants exhibit a slight loss increase compared to their MHA counterparts (0.4929 for GQA+FFN vs. 0.4886 for MHA+FFN), reflecting the minor representational cost of sharing KV heads across query groups. However, this trade-off is well-justified: GQA+FFN achieves the fastest iteration time of 0.242s—marginally faster than MHA+FFN—thanks to reduced memory bandwidth requirements from the smaller KV projection. The MLA+MoE configuration, despite being the most architecturally complex, records the highest loss (0.4996) and slowest iteration time (0.285s). The low-rank compression overhead in MLA's query and KV paths adds computational cost that is not amortized on short context windows (512 tokens), where the KV cache savings are minimal.
+
+Overall, the TinyStories results establish an important baseline: for simple, low-entropy datasets, the classical MHA+FFN architecture is optimal in terms of both quality and efficiency. The advanced mechanisms—MoE's conditional computation, GQA's KV sharing, and MLA's latent compression—are designed to shine at larger scales, where richer data distributions and longer contexts demand greater model capacity and memory efficiency. The next section on OpenWebText validates this hypothesis.
 
 ### Optimizer Compaison
 
@@ -713,7 +729,24 @@ The advantage persists throughout training: at convergence, Muon+AdamW reaches a
 
 ### Experiment on OpenWebText
 
+All OpenWebText experiments use a 12-layer Transformer with `d_model=768`, 16 attention heads, `d_ff=3072`, context length 2048, batch size 16, and are trained for 32K iterations with the hybrid Muon+AdamW optimizer under mixed-precision training on a single RTX 4090. All configurations use MoE with 8 routed experts, top-1 routing, and 1 shared expert (applied to layers 1–11). GQA uses 8 KV heads (group size 2). MLA uses `q_lora_rank=192`, `kv_lora_rank=96`, and `rope_dim=16`. DSA (DeepSeek Sparse Attention) experiments are currently in progress.
 
+| Attention | Forward | **Loss** | **PPL** | **Iteration Time** |
+|-----------|---------|----------|---------|---------------------|
+| MHA       | MoE     | 1.1803   | 3.28    | 4.25s               |
+| GQA       | MoE     | 1.1940   | 3.30    | 4.07s               |
+| MLA       | MoE     | 1.1997   | 3.32    | 3.95s               |
+| DSA       | MoE     | —        | —       | —                   |
+
+Moving from TinyStories to OpenWebText—a diverse, large-scale web corpus with significantly richer vocabulary and more complex linguistic structures—reveals a far more meaningful efficiency-quality trade-off across attention mechanisms. The performance gaps, while still moderate in absolute terms, are substantially more pronounced than those observed on TinyStories, confirming that architectural differences become increasingly relevant as dataset complexity grows.
+
+MHA+MoE achieves the best modeling quality with a loss of 1.1803 (PPL 3.28), serving as the quality ceiling for this comparison. Each query head maintains its own independent KV representation, providing maximum representational flexibility for capturing the diverse patterns present in web text. However, this comes at the cost of the highest iteration time (4.25s), as the full KV computation for all 16 heads creates substantial memory bandwidth pressure on the longer 2048-token context window.
+
+GQA+MoE strikes a compelling balance, achieving a loss of 1.1940 (PPL 3.30)—only a 1.2% increase over MHA—while reducing iteration time by 4.2% to 4.07s. The 8 KV heads (group size 2) reduce the KV projection parameters and cache size by half relative to MHA, which directly translates to faster computation. The minimal quality degradation confirms the finding from the GQA literature that adjacent query heads learn highly correlated attention patterns, making KV sharing an effective compression strategy even on complex web data.
+
+MLA+MoE presents the most aggressive trade-off: it records the highest loss (1.1997, PPL 3.32) but achieves the fastest iteration time of 3.95s—a 7.1% speedup compared to MHA+MoE. The low-rank factorization compresses the KV representation from full `d_model` down to `kv_lora_rank=96`, dramatically reducing memory bandwidth during attention computation. The slightly higher loss can be attributed to the information bottleneck introduced by the low-rank compression, as well as the overhead of the decoupled RoPE design which adds a separate positional encoding path. Importantly, the efficiency advantage of MLA is expected to become even more pronounced during inference, where the compressed KV cache enables significantly higher throughput and longer context windows—a benefit not captured by training-time iteration metrics alone.
+
+A clear trend emerges across the three attention mechanisms: as the architecture increasingly compresses the KV representation (MHA → GQA → MLA), iteration time decreases monotonically (4.25s → 4.07s → 3.95s) while loss increases modestly (1.1803 → 1.1940 → 1.1997). This reveals a smooth Pareto frontier between training speed and modeling quality, where each mechanism occupies a distinct operating point. For applications prioritizing raw language modeling quality, MHA+MoE remains the best choice. For deployment scenarios where inference efficiency and memory footprint are critical—such as serving long-context requests—MLA+MoE offers the most favorable overall trade-off, as its training-time quality gap is small while its inference-time advantages in KV cache compression are substantial.
 
 ---
 

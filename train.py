@@ -74,11 +74,10 @@ def train(model: nn.Module, optimizer: torch.optim.Optimizer,
 
     # get next batch from DataLoader iterator and move to device
     inputs, targets = next(train_loader_iter)
-    inputs = inputs.to(device,  non_blocking=True)
+    inputs = inputs.to(device, non_blocking=True)
     targets = targets.to(device, non_blocking=True)
 
-    # configure mixed precision training, which means:
-    # FP32 weights + BF16 forward pass + FP32 optimizer
+    # configure mixed precision training
     use_amp = config.get('use_amp', False)
     amp_dtype = torch.bfloat16 if use_amp else torch.float32
 
@@ -119,8 +118,6 @@ def valid(model: nn.Module, val_loader: DataLoader, config: Dict[str, Any], devi
     total_loss = 0.0
     num_batches = config['eval_batches']
 
-    # configure mixed precision training, which means:
-    # FP32 weights + BF16 forward pass + FP32 optimizer
     use_amp = config.get('use_amp', False)
     amp_dtype = torch.bfloat16 if use_amp else torch.float32
 
@@ -152,12 +149,9 @@ def main():
 
     parser.add_argument('--optimizer', type=str, default=None, choices=['muon', 'adamw'])
     # Muon-specific arguments (can override config file values)
-    parser.add_argument('--muon_lr', type=float, default=None,
-                        help='Learning rate for Muon optimizer (overrides config)')
-    parser.add_argument('--muon_momentum', type=float, default=None,
-                        help='Momentum for Muon optimizer (overrides config)')
-    parser.add_argument('--muon_ns_steps', type=int, default=None,
-                        help='Newton-Schulz iterations for Muon (overrides config)')
+    parser.add_argument('--muon_lr', type=float, default=None, help='Learning rate for Muon optimizer ')
+    parser.add_argument('--muon_momentum', type=float, default=None, help='Momentum for Muon optimizer')
+    parser.add_argument('--muon_ns_steps', type=int, default=None, help='Newton-Schulz iters for Muon')
     args = parser.parse_args()
 
     # Load configuration using Config class
@@ -214,26 +208,27 @@ def main():
     config_dict = config.to_dict()
     train_data, valid_data = prepare_data(config_dict)
 
-    num_workers = config.num_workers
-    use_workers = num_workers > 0
-
-    # Create training dataset and loader
-    train_dataset = PretrainDataset(
-        data=train_data, context_length=config.context_length)
+    train_dataset = PretrainDataset(data=train_data, context_length=config.context_length)
     train_loader = DataLoader(
-        train_dataset, batch_size=config.batch_size, shuffle=True,
-        num_workers=num_workers, pin_memory=use_workers,
-        persistent_workers=use_workers, prefetch_factor=4 if use_workers else None,
+        train_dataset, 
+        batch_size=config.batch_size, 
+        shuffle=True,
+        num_workers=4, 
+        pin_memory=True,
+        persistent_workers=True, 
+        prefetch_factor=4,
         drop_last=True,
     )
 
-    # Create validation dataset and loader
-    valid_dataset = PretrainDataset(
-        data=valid_data, context_length=config.context_length)
+    valid_dataset = PretrainDataset(data=valid_data, context_length=config.context_length)
     valid_loader = DataLoader(
-        valid_dataset, batch_size=config.batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=use_workers,
-        persistent_workers=use_workers, prefetch_factor=4 if use_workers else None,
+        valid_dataset, 
+        batch_size=config.batch_size, 
+        shuffle=False,
+        num_workers=4, 
+        pin_memory=True,
+        persistent_workers=True, 
+        prefetch_factor=4,
         drop_last=False,
     )
 
@@ -241,8 +236,11 @@ def main():
     print(f"Validate dataset: {len(valid_dataset):,} samples")
     print(f"DataLoaders initialized successfully!\n")
 
-    # Initialize model with FP32 weights (AMP handles BF16 forward pass)
-    model = TransformerLM(config=config, device=device, dtype=torch.float32).to(device)
+    # Initialize model with BF16 weights for native mixed-precision training.
+    # This eliminates costly FP32→BF16 weight casting on every forward pass.
+    # The optimizer (fused AdamW) maintains FP32 master weights internally.
+    model = TransformerLM(config=config, device=device, dtype=torch.bfloat16).to(device)
+
     # count trainable parameters of the model
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -250,11 +248,8 @@ def main():
     print(f"Trainable parameters: {trainable_params:,}")
 
     # Compile the model with torch.compile for better performance
-    # - mode="default": Balanced optimization between compilation time and performance
-    # - fullgraph=False: Allow graph breaks for dynamic ops (bincount in MoE, etc.)
-    # - dynamic=True: Support dynamic tensor shapes
     print("Compiling model with torch.compile...")
-    model = torch.compile(model, mode="default", fullgraph=False, dynamic=True)
+    model = torch.compile(model, mode="default", fullgraph=True)
     print("Model compiled successfully")
 
     # Initialize optimizer based on config
@@ -438,7 +433,7 @@ def main():
         if (iteration + 1) % config.log_interval == 0:
             avg_loss = running_loss / config.log_interval
             perplexity = np.exp(avg_loss)
-            # [OPT] Only sync grad_norm when logging
+            # only sync grad_norm when logging
             grad_norm_value = grad_norm_tensor.item()
 
             if use_muon:
@@ -473,8 +468,7 @@ def main():
         # Validation and checkpointing
         if (iteration + 1) % config.eval_interval == 0:
             print("Running validation...")
-            val_loss, val_perplexity = valid(
-                model, valid_loader, config_dict, device)
+            val_loss, val_perplexity = valid(model, valid_loader, config_dict, device)
 
             val_content = f"Validation | Loss: {val_loss:.4f} | PPL: {val_perplexity:.2f}"
             print(val_content)
@@ -488,10 +482,8 @@ def main():
             }, step=iteration + 1)
 
             # save checkpoint
-            checkpoint_path = checkpoint_dir / \
-                f"checkpoint_iter_{iteration + 1:06d}.pt"
-            save_checkpoint(model, optimizer, iteration +
-                            1, str(checkpoint_path))
+            checkpoint_path = checkpoint_dir / f"checkpoint_iter_{iteration + 1:06d}.pt"
+            save_checkpoint(model, optimizer, iteration + 1, str(checkpoint_path))
             print(f"Saved checkpoint: {checkpoint_path}")
 
             # Save best model
@@ -499,8 +491,7 @@ def main():
                 best_val_loss = val_loss
                 best_val_ppl = val_perplexity
                 best_checkpoint_path = checkpoint_dir / "best_model.pt"
-                save_checkpoint(model, optimizer, iteration +
-                                1, str(best_checkpoint_path))
+                save_checkpoint(model, optimizer, iteration + 1, str(best_checkpoint_path))
                 best_model_content = f"New best model saved: {best_checkpoint_path} (val_loss: {val_loss:.4f}, PPL: {val_perplexity:.2f})"
                 print(best_model_content)
 
@@ -520,25 +511,18 @@ def main():
     # Save training completion info to record file
     with open(record_file_path, 'a') as record_file:
         record_file.write(f"\n{'='*50}\n")
-        record_file.write(
-            f"Training completed at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        record_file.write(f"Training completed at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
         record_file.write(f"Total iterations: {config.max_iterations}\n")
-        record_file.write(
-            f"Final validation loss: {best_val_loss:.4f}   Final PPL: {best_val_ppl:.2f}\n")
+        record_file.write(f"Final validation loss: {best_val_loss:.4f}   Final PPL: {best_val_ppl:.2f}\n")
         record_file.write(f"{'='*50}\n")
 
-    # Print final results
-    print(
-        f"\nFinal validation loss: {best_val_loss:.4f}   Final PPL: {best_val_ppl:.2f}")
+    print(f"\nFinal validation loss: {best_val_loss:.4f}   Final PPL: {best_val_ppl:.2f}")
 
-    # Save final checkpoint
     final_checkpoint_path = checkpoint_dir / "final_model.pt"
-    save_checkpoint(model, optimizer, config.max_iterations,
-                    str(final_checkpoint_path))
+    save_checkpoint(model, optimizer, config.max_iterations, str(final_checkpoint_path))
     final_checkpoint_content = f"Final checkpoint saved: {final_checkpoint_path}"
-    print(final_checkpoint_content)
+    print(f"Final checkpoint saved: {final_checkpoint_path}")
 
-    # Save final checkpoint info to record file
     with open(record_file_path, 'a') as record_file:
         record_file.write(f"[FINAL] {final_checkpoint_content}\n")
 

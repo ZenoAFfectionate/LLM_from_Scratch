@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from typing import Optional
 
-from .utils import RotaryPositionalEmbedding, store_mla_cache
+from .utils import RotaryPositionalEmbedding, store_mla_cache, compute_varlen_positions
 
 from torch.nn import functional as F
 
@@ -40,12 +40,12 @@ class MultiHeadLatentAttention(nn.Module):
         self.d_model = d_model
         self.num_heads = head_num
         self.head_dim = d_model // head_num
-        self.scale = 1.0 / ((self.head_dim + self.rope_dim) ** 0.5)
 
         # parameter for low-rank compression
         self.rope_dim = rope_dim if rope_dim is not None else 8
         self.kv_lora_rank = kv_lora_rank if kv_lora_rank is not None else d_model // 4
         self.q_lora_rank  = q_lora_rank  if q_lora_rank  is not None else self.kv_lora_rank
+        self.scale = 1.0 / ((self.head_dim + self.rope_dim) ** 0.5)
 
         # Paged attention mode (for inference with engine)
         self.paged_attention = False
@@ -125,7 +125,8 @@ class MultiHeadLatentAttention(nn.Module):
         k = k.transpose(1, 2)  # (batch, heads, seq_len, head_dim + rope_dim)
         v = v.transpose(1, 2)  # (batch, heads, seq_len, head_dim)
 
-        attn_output = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        # Use is_causal=True to enable FlashAttention 2 backend
+        attn_output = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch, seq_len, -1)
         return self.output_proj(attn_output)
 
@@ -150,17 +151,10 @@ class MultiHeadLatentAttention(nn.Module):
         total_tokens = bsz * seq_len
         x_flat = x.view(total_tokens, self.d_model)
 
-        # =====================================================
-        # Inefficient! Compute token positions based on context
-        # =====================================================
+        # Compute token positions based on context (all on GPU, no CPU-GPU sync)
         if context.is_prefill and context.cu_seqlens_q is not None:
-            positions = []
-            # .cpu() and .tolist() is inefficient for GPU
-            cu_seqlens = context.cu_seqlens_q.cpu().tolist()
-            for i in range(len(cu_seqlens) - 1):
-                seq_len_i = cu_seqlens[i+1] - cu_seqlens[i]
-                positions.extend(range(seq_len_i))
-            token_positions = torch.tensor(positions, dtype=torch.long, device=x.device)
+            token_positions = compute_varlen_positions(
+                context.cu_seqlens_q, total_tokens, x.device)
         elif context.is_prefill:
             token_positions = torch.arange(total_tokens, device=x.device)
         else:
@@ -235,21 +229,19 @@ class MultiHeadLatentAttention(nn.Module):
             output: (total_tokens, num_heads, head_dim)
         """
         num_seqs = cu_seqlens.shape[0] - 1
+        # Single CPU transfer instead of 2*N .item() calls
+        cu_seqlens_list = cu_seqlens.tolist()
         outputs = []
 
         for i in range(num_seqs):
-            start = cu_seqlens[i].item()
-            end = cu_seqlens[i + 1].item()
-            seq_len = end - start
+            start, end = cu_seqlens_list[i], cu_seqlens_list[i + 1]
 
             q_seq = q[start:end].transpose(0, 1).unsqueeze(0)  # (1, heads, seq, dim)
             k_seq = k[start:end].transpose(0, 1).unsqueeze(0)  # (1, heads, seq, dim)
             v_seq = v[start:end].transpose(0, 1).unsqueeze(0)  # (1, heads, seq, head_dim)
 
-            # Causal mask
-            mask = torch.tril(torch.ones(seq_len, seq_len, device=q.device, dtype=torch.bool))
-
-            out = F.scaled_dot_product_attention(q_seq, k_seq, v_seq, attn_mask=mask)
+            # Use is_causal=True to enable FlashAttention 2 and avoid mask allocation
+            out = F.scaled_dot_product_attention(q_seq, k_seq, v_seq, is_causal=True)
             out = out.squeeze(0).transpose(0, 1)  # (seq, heads, head_dim)
             outputs.append(out)
 
@@ -275,17 +267,20 @@ class MultiHeadLatentAttention(nn.Module):
         Returns:
             output: (batch_size, num_heads, head_dim)
         """
-        max_context_len = context_lens.max().item()
-
         q_nope = q_nope.view(batch_size, self.num_heads, self.head_dim)
         q_rope = q_rope.view(batch_size, self.num_heads, self.rope_dim)
+
+        # Transfer to CPU once to avoid per-element GPU-CPU syncs in the loop
+        context_lens_cpu = context_lens.cpu()
+        block_tables_cpu = block_tables.cpu()
+        max_context_len = context_lens_cpu.max().item()
 
         # gather cached KV and PE from paged cache
         cached_kv_list = []  # k_cache: (num_blocks, block_size, kv_lora_rank)
         cached_pe_list = []  # v_cache: (num_blocks, block_size, rope_dim)
 
         for b in range(batch_size):
-            ctx_len = context_lens[b].item()
+            ctx_len = context_lens_cpu[b].item()
             num_blocks_needed = (ctx_len + self.block_size - 1) // self.block_size
 
             kv_tokens = []  # (num_blocks, block_size, kv_lora_rank)
@@ -293,10 +288,10 @@ class MultiHeadLatentAttention(nn.Module):
 
             # extract cached blocks from table
             for block_idx in range(num_blocks_needed):
-                physical_block = block_tables[b, block_idx].item()
+                physical_block = block_tables_cpu[b, block_idx].item()
                 # skip invalid blocks
                 if physical_block == -1: continue
-                # 
+                #
                 if block_idx == num_blocks_needed - 1:
                     tokens_in_block = ctx_len - block_idx * self.block_size
                 else:

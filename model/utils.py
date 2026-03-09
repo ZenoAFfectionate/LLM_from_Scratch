@@ -8,6 +8,14 @@ import torch.optim as optim
 
 from typing import Union, BinaryIO, IO, Optional
 
+# Try to import Triton for fused RMSNorm kernels
+try:
+    import triton
+    import triton.language as tl
+    _HAS_TRITON = True
+except ImportError:
+    _HAS_TRITON = False
+
 
 # ------------------------------------
 #  Problem 2: Implement Linear Module
@@ -45,7 +53,8 @@ class RMSNorm(nn.Module):
     def __init__(self, d_model: int, eps: float = 1e-5, device=None):
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(d_model, dtype=torch.float32, device=device))
+        self.weight = nn.Parameter(torch.ones(
+            d_model, dtype=torch.float32, device=device))
 
     def forward(self, x: torch.Tensor, residual: Optional[torch.Tensor] = None):
         dtype = x.dtype

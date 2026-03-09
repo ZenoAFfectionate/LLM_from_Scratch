@@ -4,7 +4,8 @@ from typing import Optional
 
 from .utils import (
     RotaryPositionalEmbedding,
-    store_kvcache, flash_attention_prefill, paged_attention_decode
+    store_kvcache, flash_attention_prefill, paged_attention_decode,
+    compute_varlen_positions
 )
 
 from torch.nn import functional as F
@@ -78,8 +79,9 @@ class MultiHeadSelfAttention(nn.Module):
             q = self.rope(q, token_positions)
             k = self.rope(k, token_positions)
 
-        # Training: standard attention
-        attn_output = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        # Training: causal attention with is_causal=True to enable FlashAttention 2
+        # (FlashAttention requires is_causal flag instead of explicit mask tensor)
+        attn_output = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, seq_len, d_model)
         return self.output_proj(attn_output)
 
@@ -101,16 +103,10 @@ class MultiHeadSelfAttention(nn.Module):
         total_tokens = bsz * seq_len
         x_flat = x.view(total_tokens, self.d_model)  # Flatten for processing
 
-        # Compute token positions based on context
+        # Compute token positions based on context (all on GPU, no CPU-GPU sync)
         if context.is_prefill and context.cu_seqlens_q is not None:
-            # For varlen prefill: positions restart at 0 for each sequence
-            positions = []
-            cu_seqlens = context.cu_seqlens_q.cpu().tolist()
-            for i in range(len(cu_seqlens) - 1):
-                seq_len_i = cu_seqlens[i+1] - cu_seqlens[i]
-                positions.extend(range(seq_len_i))
-            token_positions = torch.tensor(
-                positions, dtype=torch.long, device=x.device)
+            token_positions = compute_varlen_positions(
+                context.cu_seqlens_q, total_tokens, x.device)
         elif context.is_prefill:
             token_positions = torch.arange(total_tokens, device=x.device)
         else:

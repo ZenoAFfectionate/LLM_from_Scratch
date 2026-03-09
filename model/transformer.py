@@ -83,14 +83,12 @@ class Block(nn.Module):
                 dtype=dtype
             )
         else:
-            self.ffn = MLP(config.d_model, config.d_ff,
-                           device=device, dtype=dtype)
+            self.ffn = MLP(config.d_model, config.d_ff, device=device, dtype=dtype)
 
         # RMSNorm always uses FP32 weights (handled internally)
         self.att_norm = RMSNorm(config.d_model, device=device)
         self.ffn_norm = RMSNorm(config.d_model, device=device)
-        self.dropout = nn.Dropout(
-            config.dropout) if config.dropout else nn.Identity()
+        self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x: torch.Tensor, residual: torch.Tensor,
                 mask: torch.Tensor = None) -> torch.Tensor:
@@ -111,11 +109,7 @@ class Block(nn.Module):
             x, residual = self.att_norm(x), x
         else:
             x, residual = self.att_norm(x, residual)
-
-        if self.attention_type == "DSA":
-            x, _ = self.att(x, mask, use_sparse=True)
-        else:
-            x = self.att(x, mask)
+        x = self.att(x, mask)
         x = self.dropout(x)
 
         # Fused Add & Norm for FFN
@@ -132,21 +126,15 @@ class Block(nn.Module):
 class TransformerLM(nn.Module):
     """Language Model based on stacked Transformer Decoder Blocks"""
 
-    def __init__(
-        self,
-        config: Config,
-        device=None,
-        dtype=None
-    ):
+    def __init__(self, config: Config, device=None, dtype=None):
         super().__init__()
         self.config = config
         self.use_moe = config.use_moe
         self.attention_type = config.attention_type
         self.context_length = config.context_length
 
-        # Model weights are always FP32 for stability. Mixed precision only affects forward pass via autocast.
-        self.token_embeddings = Embedding(
-            config.vocab_size, config.d_model, device=device, dtype=dtype)
+        # Model weights are always FP32 for stability
+        self.token_embeddings = Embedding(config.vocab_size, config.d_model, device=device, dtype=dtype)
 
         rope_dim = config.d_model // config.num_heads
         if config.attention_type in ("MLA", "DSA"):
@@ -163,34 +151,30 @@ class TransformerLM(nn.Module):
             Block(
                 config=config,
                 rope=self.rope,
-                use_moe=(config.use_moe and (
-                    config.moe_layers is None or i in config.moe_layers)),
+                use_moe=(config.use_moe and (config.moe_layers is None or i in config.moe_layers)),
                 device=device,
                 dtype=dtype
             )
             for i in range(config.num_layers)
         ])
         self.final_norm = RMSNorm(config.d_model, device=device)
-        self.lm_head = nn.Linear(
-            config.d_model, config.vocab_size, device=device, dtype=dtype)
+        self.lm_head = nn.Linear(config.d_model, config.vocab_size, device=device, dtype=dtype)
 
     def forward(self, x: torch.Tensor):
         """
         Forward pass through the transformer language model with Fused Add & Norm.
 
-        The causal attention mask is constructed once here and shared across all layers
-        for efficiency. This avoids redundant mask construction in each attention layer.
-        The residual connection is fused with normalization for memory efficiency.
+        MHA/GQA/MLA use is_causal=True so no explicit mask tensor is needed.
+        DSA requires an explicit mask for its sparse indexer, so we only create
+        the mask when the attention type is DSA.
         """
         seq_len = x.size(1)
 
         x = self.token_embeddings(x)  # apply token embedding
 
-        mask = None
-        # construct boolean causal mask once for training (True means allowed)
-        if seq_len > 1:
-            mask = torch.tril(torch.ones((seq_len, seq_len),
-                              device=x.device, dtype=torch.bool))
+        mask = None  # Only DSA needs an explicit causal mask (for its sparse indexer).
+        if self.attention_type == "DSA" and seq_len > 1:
+            mask = torch.tril(torch.ones((seq_len, seq_len), device=x.device, dtype=torch.bool))
 
         residual = None
         for block in self.layers:
@@ -199,10 +183,10 @@ class TransformerLM(nn.Module):
         x, _ = self.final_norm(x, residual)
         return self.lm_head(x)  # model token probability distribution
 
+
     def update_moe_biases(self):
-        """Update expert biases for all MoE layers (auxiliary-loss-free load balancing)"""
-        if not self.use_moe:
-            return
+        """Update expert biases for aux-loss-free load balance"""
+        if not self.use_moe: return
 
         for layer in self.layers:
             if hasattr(layer, 'use_moe') and layer.use_moe:

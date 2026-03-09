@@ -2,6 +2,7 @@ import math
 import torch
 import torch._dynamo
 import torch.nn as nn
+import torch.nn.init as init
 import torch.nn.functional as F
 
 from model.architecture.mlp import MLP
@@ -18,7 +19,8 @@ class Gate(nn.Module):
         num_experts_per_tok: int,
         bias_update_speed: float = 0.01,
         aux_seq_loss_alpha: float = 0.01,
-        device=None
+        device=None,
+        dtype=None
     ):
         super().__init__()
         # parameters for MoE gating
@@ -29,14 +31,10 @@ class Gate(nn.Module):
         self.seq_alpha = aux_seq_loss_alpha
         self.bias_update_speed = bias_update_speed
         # initialize gating weights for affinity score calculation
-        self.weight = nn.Parameter(torch.empty((self.n_routed_experts, self.hidden_size)))
-        self.reset_parameters()
+        self.weight = nn.Parameter(torch.empty((self.n_routed_experts, self.hidden_size), device=device, dtype=dtype))
+        init.kaiming_uniform_(self.weight, a=math.sqrt(5))
         self.register_buffer('expert_load', torch.zeros(self.n_routed_experts, device=device, dtype=torch.long))
         self.register_buffer('expert_bias', torch.zeros(self.n_routed_experts, device=device, dtype=torch.float32))
-
-    def reset_parameters(self) -> None:
-        import torch.nn.init as init
-        init.kaiming_uniform_(self.weight, a=math.sqrt(5))
 
     def forward(self, x):
         """ Forward pass with auxiliary-loss-free load balancing """
@@ -55,7 +53,7 @@ class Gate(nn.Module):
             denominator = topk_weights.sum(dim=-1, keepdim=True) + 1e-10
             topk_weights = topk_weights / denominator
 
-        # use one_hot + sum instead of bincount - faster for small n_routed_experts
+        # use one_hot + sum instead of bincount: faster
         expert_token_counts = None
         if self.training:
             expert_token_counts = F.one_hot(
@@ -135,6 +133,7 @@ class MOE(nn.Module):
         n_shared_experts: int = 0,
         bias_update_speed: float = 0.01,
         aux_seq_loss_alpha: float = 0.01,
+        capacity_factor: float = 1.5,
         device=None,
         dtype=None
     ):
@@ -144,9 +143,10 @@ class MOE(nn.Module):
         self.n_routed_experts = n_routed_experts
         self.num_experts_per_tok = num_experts_per_tok
         self.n_shared_experts = n_shared_experts
-        # ==========
-        # Modified: write efficient kernel for expert computation
-        # ==========
+        self.capacity_factor = capacity_factor
+        # ============================================== #
+        # write efficient kernel for expert computation  #
+        # ============================================== # 
         self.experts = nn.ModuleList([
             MLP(d_model, d_ff, device=device, dtype=dtype)
             for _ in range(n_routed_experts)
@@ -157,84 +157,117 @@ class MOE(nn.Module):
             num_experts_per_tok=num_experts_per_tok,
             aux_seq_loss_alpha=aux_seq_loss_alpha,
             bias_update_speed=bias_update_speed,
-            device=device,
+            dtype=dtype,
         )
         # Initialize shared expert (single MLP)
         if n_shared_experts > 0:
             self.shared_expert = MLP(d_model, d_ff, device=device, dtype=dtype)
 
-    # @torch._dynamo.disable()
+    @staticmethod
+    def _compute_within_expert_positions(sorted_expert_ids):
+        """
+        Compute each token's position within its expert group, entirely on GPU.
+
+        Given sorted expert assignments [0,0,0,2,2,5,5,5], returns within-expert
+        positions [0,1,2,0,1,0,1,2]. Uses a cummax trick on segment boundaries
+        to avoid any GPU-CPU synchronization.
+
+        The trick: at each segment boundary (where expert ID changes), record the
+        global position. cummax propagates this value forward through the segment.
+        Subtracting from global position yields the local (within-segment) index.
+        """
+        n = sorted_expert_ids.shape[0]
+        device = sorted_expert_ids.device
+        global_pos = torch.arange(n, device=device)
+        # Fuse boundary detection with position marking: at each segment boundary
+        # (where expert ID changes), record the global position directly
+        boundary_markers = torch.zeros(n, device=device, dtype=torch.long)
+        if n > 1:
+            mask = sorted_expert_ids[1:] != sorted_expert_ids[:-1]
+            boundary_markers[1:] = mask * global_pos[1:]
+        # cummax propagates the last boundary's global_pos forward,
+        # so (global_pos - seg_starts) gives within-segment position
+        seg_starts = torch.cummax(boundary_markers, dim=0).values
+        return global_pos - seg_starts
+
     def forward(self, x):
         """
-        MoE forward pass with torch.compile disabled.
+        MoE forward pass using padded fixed-capacity expert computation.
 
-        Reason: MoE routing is inherently dynamic - the number of tokens per expert
-        varies at runtime. The .tolist() call required by torch.split() causes
-        unavoidable graph breaks. Running in eager mode avoids recompilation overhead.
+        Uses a fixed-capacity padding scheme to avoid GPU-CPU synchronization
+        from variable-length torch.split(). All expert inputs are padded to a
+        deterministic capacity derived from Python-int batch dimensions, enabling
+        consistent tensor shapes and torch.compile compatibility.
         """
         identity = x
         batch_size, seq_len, _ = x.shape
+        n_total_tokens = batch_size * seq_len
 
-        # choose expert using gate mechanism (auxiliary sequence-wise loss)
+        # gate routing (aux_seq_loss and expert_token_counts are None when not training)
         topk_idx, topk_weight, aux_seq_loss, expert_token_counts = self.gate(x)
-        # reshape for token-level processing
         x_flat = x.view(-1, x.shape[-1])   # (batch_size * seq_len, d_model)
         flat_topk_idx = topk_idx.view(-1)  # (batch_size * seq_len * top_k,)
+        flat_topk_weight = topk_weight.view(-1)
 
-        if self.training:
-            n_total_tokens = batch_size * seq_len
-            flat_topk_weight = topk_weight.view(-1)
+        # create token indices for each expert selection to represents
+        # which original token each selection belongs to (batch*seq*top_k,)
+        token_indices = torch.arange(
+            n_total_tokens, device=x_flat.device
+        ).repeat_interleave(self.num_experts_per_tok)
 
-            # create token indices for each expert selection to represents
-            # which original token each selection belongs to (batch*seq*top_k,)
-            token_indices = torch.arange(
-                n_total_tokens, device=x_flat.device
-            ).repeat_interleave(self.num_experts_per_tok)
+        # sort by expert index to create contiguous chunks: O(N log N)
+        sorted_expert_ids, sorted_expert_idx = torch.sort(flat_topk_idx)
+        sorted_token_idx = token_indices[sorted_expert_idx]
+        sorted_weight = flat_topk_weight[sorted_expert_idx]
+        sorted_tokens = x_flat[sorted_token_idx]  # permute tokens to match expert group
 
-            # sort by expert index to create contiguous chunks: O(N log N)
-            # this will groups all tokens for Expert 0, then Expert 1, etc.
-            sorted_expert_idx = torch.argsort(flat_topk_idx)
-            sorted_token_idx = token_indices[sorted_expert_idx]
-            sorted_weight = flat_topk_weight[sorted_expert_idx]
-            sorted_tokens = x_flat[sorted_token_idx]  # permute tokens to match expert group
+        # compute within-expert position index on GPU using cummax trick
+        within_pos = self._compute_within_expert_positions(sorted_expert_ids)
 
-            # reuse expert_token_counts from Gate - sync here
-            expert_counts_list = expert_token_counts.tolist()
-            # split sorted_tokens into chunks by expert
-            expert_inputs = torch.split(sorted_tokens, expert_counts_list)
+        # fixed capacity from Python ints only — no GPU-CPU sync!
+        # With good load balancing, max tokens per expert ≈ N*top_k/n_experts.
+        # capacity_factor provides headroom (e.g., 1.5 = 50% buffer).
+        capacity = math.ceil(
+            n_total_tokens * self.num_experts_per_tok
+            / self.n_routed_experts * self.capacity_factor
+        )
+        within_pos = torch.clamp(within_pos, max=capacity - 1)
 
-            # Process each expert and concatenate all outputs back
-            expert_outputs = [
-                self.experts[expert_id](expert_inputs[expert_id])
-                for expert_id in range(self.n_routed_experts)
-            ]
-            y_sorted = torch.cat(expert_outputs, dim=0)
+        # scatter tokens into padded buffer: (n_experts, capacity, d_model)
+        padded_input = x_flat.new_zeros(
+            self.n_routed_experts, capacity, self.d_model
+        )
+        padded_input[sorted_expert_ids, within_pos] = sorted_tokens
 
-            # Fused Triton kernel: weight multiplication + scatter-add using segment reduction
-            # This is MUCH faster than atomic scatter-add because:
-            #   1. Re-sorts by target token to enable contiguous segment access
-            #   2. Uses segment reduction - each output token sums its segment
-            #   3. Fully coalesced reads and writes
-            y_flat = fused_scatter_add_weighted(
-                y_sorted,           # raw expert outputs
-                sorted_token_idx,   # target token indices
-                sorted_weight,      # routing weights
-                n_total_tokens,     # number of original tokens
-                self.num_experts_per_tok  # top_k for segment loop unrolling
-            )
+        # process all experts in-place (no separate output buffer needed)
+        for expert_id in range(self.n_routed_experts):
+            padded_input[expert_id] = self.experts[expert_id](padded_input[expert_id])
 
-            y = y_flat.view(batch_size, seq_len, -1)
-        else:
-            # use existing optimized inference path
-            y = self.moe_infer(x_flat, flat_topk_idx, topk_weight.view(-1, 1))
-            y = y.view(batch_size, seq_len, -1)
+        # Gather outputs back in sorted order
+        y_sorted = padded_input[sorted_expert_ids, within_pos]
 
+        # Weight multiplication + scatter-add using segment reduction
+        # This is MUCH faster than atomic scatter-add because:
+        #   1. Re-sorts by target token to enable contiguous segment access
+        #   2. Uses segment reduction - each output token sums its segment
+        #   3. Fully coalesced reads and writes
+        y_flat = fused_scatter_add_weighted(
+            y_sorted,           # raw expert outputs
+            sorted_token_idx,   # target token indices
+            sorted_weight,      # routing weights
+            n_total_tokens,     # number of original tokens
+            self.num_experts_per_tok  # top_k for segment loop unrolling
+        )
+
+        y = y_flat.view(batch_size, seq_len, -1)
         # apply shared expert and add to output
         if self.n_shared_experts > 0:
             y = y + self.shared_expert(identity)
 
-        self.aux_loss = aux_seq_loss
-        self._total_tokens = batch_size * seq_len
+        # training-only bookkeeping (aux_seq_loss is None when not training)
+        if self.training:
+            self.aux_loss = aux_seq_loss
+            self._total_tokens = n_total_tokens
 
         return y
 
@@ -246,53 +279,3 @@ class MOE(nn.Module):
         if hasattr(self, '_total_tokens'):
             self.gate.update_bias(self._total_tokens)
 
-    @torch.no_grad()
-    def moe_infer(self, x, flat_expert_indices, flat_expert_weights):
-        """Optimized inference logic for Mixture-of-Experts
-
-        [OPT] Optimizations applied:
-        1. Pre-convert weights dtype once instead of per-expert
-        2. Use one_hot + sum instead of bincount
-        3. Use torch.split to avoid cumsum + tolist overhead
-        4. Use expand instead of repeat for memory efficiency
-        """
-        expert_cache = torch.zeros_like(x)
-
-        # sort indices to group tokens by expert and count
-        idxs = flat_expert_indices.argsort()
-        counts = F.one_hot(
-            flat_expert_indices,
-            num_classes=self.n_routed_experts
-        ).sum(dim=0)
-
-        d_model = x.shape[-1]  # 
-        counts_list = counts.tolist()  # 
-
-        token_idxs = idxs // self.num_experts_per_tok
-
-        # pre-convert weights to match x dtype once
-        if flat_expert_weights.dtype != x.dtype:
-            flat_expert_weights = flat_expert_weights.to(x.dtype)
-
-        # split sorted indices into per-expert chunks
-        token_idx_chunks = torch.split(token_idxs, counts_list)
-        weight_idx_chunks = torch.split(idxs, counts_list)
-
-        # loop through the batches of tokens for each expert
-        for i in range(self.n_routed_experts):
-            expert = self.experts[i]
-            exp_token_idx = token_idx_chunks[i]
-
-            # get the batch of tokens for this expert
-            expert_tokens = x[exp_token_idx]
-            # process the batch and weight the output
-            expert_out = expert(expert_tokens)
-
-            weights = flat_expert_weights[weight_idx_chunks[i]]
-            expert_out = expert_out * weights
-
-            # use expand instead of repeat for memory efficiency (no copy)
-            scatter_idx = exp_token_idx.unsqueeze(1).expand(-1, d_model)
-            expert_cache.scatter_add_(0, scatter_idx, expert_out)
-
-        return expert_cache

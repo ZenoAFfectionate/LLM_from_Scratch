@@ -119,3 +119,68 @@ def test_checkpointing(tmp_path):
         )
     # compare the optimizer state dicts
     assert are_optimizers_equal(original_optimizer_state, new_optimizer_state)
+
+
+# =============================================================================
+# Additional checkpoint behaviour tests (direct, not via adapter shim).
+# =============================================================================
+
+def _make_tiny_model():
+    return nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 2))
+
+
+def test_checkpoint_auto_appends_pt_suffix(tmp_path):
+    from model.utils import save_checkpoint
+    model = _make_tiny_model()
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    out = tmp_path / "no_suffix"
+    save_checkpoint(model, opt, iteration=1, out=str(out))
+    assert (tmp_path / "no_suffix.pt").exists()
+
+
+def test_checkpoint_handles_orig_mod_prefix(tmp_path):
+    """state-dict keys with `_orig_mod.` prefix (torch.compile) must be stripped on load."""
+    from model.utils import load_checkpoint
+    model = _make_tiny_model()
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    ckpt_path = tmp_path / "compiled.pt"
+    sd = {f"_orig_mod.{k}": v for k, v in model.state_dict().items()}
+    torch.save({
+        "model_state_dict": sd,
+        "optimizer_state_dict": opt.state_dict(),
+        "iteration": 7,
+    }, ckpt_path)
+    fresh = _make_tiny_model()
+    it = load_checkpoint(str(ckpt_path), fresh, opt)
+    assert it == 7
+    for p1, p2 in zip(model.parameters(), fresh.parameters()):
+        torch.testing.assert_close(p1.data, p2.data)
+
+
+def test_checkpoint_roundtrip_preserves_optimizer_state(tmp_path):
+    """After a few optimizer steps, save/load should leave model+optimizer
+    state byte-identical (within float comparison tolerance)."""
+    from model.utils import save_checkpoint, load_checkpoint
+    torch.manual_seed(0)
+    model = _make_tiny_model()
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    for _ in range(3):
+        opt.zero_grad()
+        model(torch.randn(2, 4)).pow(2).sum().backward()
+        opt.step()
+    ckpt = tmp_path / "round.pt"
+    save_checkpoint(model, opt, iteration=99, out=str(ckpt))
+
+    model2 = _make_tiny_model()
+    opt2 = torch.optim.AdamW(model2.parameters(), lr=1e-3)
+    it = load_checkpoint(str(ckpt), model2, opt2)
+    assert it == 99
+    for p1, p2 in zip(model.parameters(), model2.parameters()):
+        torch.testing.assert_close(p1.data, p2.data)
+    # Optimizer state mtrx should also match
+    s1 = opt.state_dict()["state"]
+    s2 = opt2.state_dict()["state"]
+    for k in s1:
+        for sk, v in s1[k].items():
+            if torch.is_tensor(v):
+                torch.testing.assert_close(v, s2[k][sk])

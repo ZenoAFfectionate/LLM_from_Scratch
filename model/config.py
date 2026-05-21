@@ -121,6 +121,31 @@ class Config:
         rope_dim: Optional[int] = 16,
         q_lora_rank: Optional[int] = 128,
         kv_lora_rank: Optional[int] = 256,
+        cca_compressed_dim: Optional[int] = None,
+        cca_conv_kernel_size: int = 3,
+        cca_num_kv_heads: Optional[int] = None,
+        cca_layer_ids: Optional[List[int]] = None,
+
+        # Gated Delta Attention (GDA) hybrid configuration
+        # When `use_gda_hybrid=True` *and* `attention_type` is one of
+        # {"MHA", "GQA", "MLA"}, the Transformer alternates 1:1: even layers
+        # (0, 2, ...) keep the primary attention, odd layers (1, 3, ...) become
+        # GDA. CCA already provides local sequence-mixing convolutions so it is
+        # **never** paired with GDA — the flag is silently ignored for CCA and
+        # the model stays pure CCA.
+        #
+        # Defaults are deliberately moderate — parameter count is roughly on
+        # par with one standard-attention layer (no bloat, no underspec):
+        #     gda_num_v_heads = num_heads          → value_dim = d_model
+        #     gda_num_k_heads = max(1, num_heads // 2)  → key_dim = ~d_model / 2 (GVA 2:1)
+        #     head_k_dim = head_v_dim = d_model // num_heads
+        #     conv kernel = 4   (matches Qwen3-Next short conv)
+        use_gda_hybrid: bool = False,
+        gda_num_v_heads: Optional[int] = None,
+        gda_num_k_heads: Optional[int] = None,
+        gda_head_k_dim: Optional[int] = None,
+        gda_head_v_dim: Optional[int] = None,
+        gda_conv_kernel_size: int = 4,
 
         # MoE configuration
         use_moe: bool = True,
@@ -207,6 +232,29 @@ class Config:
         self.rope_dim = rope_dim
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank
+        self.cca_compressed_dim = cca_compressed_dim
+        self.cca_conv_kernel_size = cca_conv_kernel_size
+        self.cca_num_kv_heads = cca_num_kv_heads
+        self.cca_layer_ids = cca_layer_ids
+
+        # Gated Delta Attention hybrid configuration
+        self.use_gda_hybrid = use_gda_hybrid
+        self.gda_num_v_heads = (
+            gda_num_v_heads if gda_num_v_heads is not None else num_heads
+        )
+        self.gda_num_k_heads = (
+            gda_num_k_heads if gda_num_k_heads is not None
+            else max(1, num_heads // 2)
+        )
+        self.gda_head_k_dim = (
+            gda_head_k_dim if gda_head_k_dim is not None
+            else d_model // num_heads
+        )
+        self.gda_head_v_dim = (
+            gda_head_v_dim if gda_head_v_dim is not None
+            else d_model // num_heads
+        )
+        self.gda_conv_kernel_size = gda_conv_kernel_size
 
         # MoE configuration
         self.use_moe = use_moe

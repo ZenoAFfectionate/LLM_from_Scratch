@@ -43,7 +43,7 @@
     "muon_weight_decay": 0.0,
     "batch_size": 128,
     "max_iterations": 10000,
-    "max_lr": 5e-04,
+    "max_lr": 0.0005,
     "min_lr": 5e-05,
     "warmup_iterations": 500,
     "beta1": 0.9,

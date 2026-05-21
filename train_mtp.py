@@ -268,13 +268,11 @@ def train(model: nn.Module, mtp_predictor: nn.Module, optimizer: torch.optim.Opt
             original_model = model._orig_mod if hasattr(
                 model, '_orig_mod') else model
 
-            x = original_model.token_embeddings(inputs)
-            residual = None
+            xl = original_model.token_embeddings(inputs)
             for block in original_model.layers:
-                x, residual = block(x, residual, mask=None)
+                xl = block(xl, mask=None)
             # Apply final norm
-            x, _ = original_model.final_norm(x, residual)
-            h_main = x  # (batch, seq_len, d_model)
+            h_main = original_model.final_norm(xl)  # (batch, seq_len, d_model)
 
             # Forward through MTP predictor
             depth_representations = mtp_predictor(

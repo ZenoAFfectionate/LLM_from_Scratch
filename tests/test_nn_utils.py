@@ -87,3 +87,115 @@ def test_gradient_clipping():
             t1_c_grad.detach().numpy(),
             atol=1e-6,
         )
+
+
+# =============================================================================
+# Additional direct tests for model/utils.py NN helpers
+# (Embedding, RMSNorm, ResScale, cross_entropy stability, softmax sum).
+# =============================================================================
+
+def test_softmax_output_sums_to_one():
+    from model.attention.utils import softmax
+    x = torch.randn(3, 5, 7)
+    sums = softmax(x, dim=-1).sum(dim=-1)
+    numpy.testing.assert_allclose(sums.numpy(), numpy.ones((3, 5)), atol=1e-6)
+
+
+def test_cross_entropy_minimised_by_correct_one_hot():
+    """Cranking the logit at the target index to a very large value drives CE → 0."""
+    from model.utils import cross_entropy
+    logits = torch.zeros(3, 5)
+    targets = torch.tensor([1, 4, 0])
+    logits[range(3), targets] = 50.0
+    assert cross_entropy(logits, targets).item() < 1e-10
+
+
+def test_cross_entropy_overflow_safe():
+    """Shifting all logits by a large constant must not change CE (LSE invariance)."""
+    from model.utils import cross_entropy
+    torch.manual_seed(0)
+    logits = torch.randn(5, 9)
+    targets = torch.randint(0, 9, (5,))
+    base = cross_entropy(logits, targets)
+    shifted = cross_entropy(logits + 1000.0, targets)
+    numpy.testing.assert_allclose(base.item(), shifted.item(), atol=1e-4)
+
+
+# ----------------------------------------------------------------- Embedding
+
+def test_embedding_matches_indexing():
+    from model.utils import Embedding
+    layer = Embedding(50, 8)
+    ids = torch.tensor([[1, 2, 3], [0, 49, 7]])
+    out = layer(ids)
+    assert out.shape == (2, 3, 8)
+    assert torch.equal(out, layer.weight[ids])
+
+
+def test_embedding_int32_ids_accepted():
+    from model.utils import Embedding
+    layer = Embedding(10, 4)
+    ids = torch.tensor([1, 2], dtype=torch.int32)
+    assert layer(ids).shape == (2, 4)
+
+
+def test_embedding_grad_only_on_used_rows():
+    from model.utils import Embedding
+    layer = Embedding(8, 4)
+    ids = torch.tensor([0, 3, 7])
+    layer(ids).pow(2).sum().backward()
+    nz = (layer.weight.grad.abs().sum(-1) > 0).tolist()
+    assert nz == [True, False, False, True, False, False, False, True]
+
+
+# ----------------------------------------------------------------- RMSNorm
+
+def test_rmsnorm_matches_reference():
+    from model.utils import RMSNorm
+    d, eps = 16, 1e-5
+    layer = RMSNorm(d, eps=eps)
+    layer.weight.data.copy_(torch.linspace(0.5, 2.0, d))
+    x = torch.randn(3, 5, d)
+    actual = layer(x)
+    ref_rms = x.float().pow(2).mean(-1, keepdim=True).add(eps).rsqrt()
+    expected = (x.float() * ref_rms * layer.weight).to(x.dtype)
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
+
+
+def test_rmsnorm_fused_residual_path():
+    """RMSNorm(x, residual=r) returns (norm(x+r), x+r)."""
+    from model.utils import RMSNorm
+    d = 8
+    layer = RMSNorm(d)
+    x = torch.randn(2, 4, d)
+    res = torch.randn(2, 4, d)
+    normed, new_res = layer(x, residual=res)
+    torch.testing.assert_close(new_res, (x + res).to(new_res.dtype))
+    expected_norm = layer(x + res)
+    torch.testing.assert_close(normed, expected_norm, atol=1e-6, rtol=1e-5)
+
+
+def test_rmsnorm_preserves_input_dtype():
+    from model.utils import RMSNorm
+    layer = RMSNorm(8)
+    for dt in [torch.float32, torch.bfloat16]:
+        y = layer(torch.randn(2, 4, 8, dtype=dt))
+        assert y.dtype == dt
+
+
+# ----------------------------------------------------------------- ResScale
+
+def test_resscale_is_identity_at_init():
+    from model.utils import ResScale
+    layer = ResScale(d_model=12)
+    x = torch.randn(3, 5, 12)
+    torch.testing.assert_close(layer(x), x)
+
+
+def test_resscale_applies_affine_after_update():
+    from model.utils import ResScale
+    layer = ResScale(d_model=4)
+    layer.alpha.data.fill_(2.0)
+    layer.beta.data.fill_(0.5)
+    x = torch.ones(1, 1, 4)
+    torch.testing.assert_close(layer(x), torch.full((1, 1, 4), 2.5))

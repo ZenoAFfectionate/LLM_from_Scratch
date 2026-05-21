@@ -70,6 +70,26 @@ class RMSNorm(nn.Module):
             return (self.weight * x).to(dtype), residual.to(dtype)
 
 
+class ResScale(nn.Module):
+    """
+    Learned Residual Scaling from ZAYA1-8B / Figliolia et al. 2025 (Eq. 6):
+
+        Res-scale(x) = α * x + β
+
+    α is initialized to 1, β to 0 → identity at initialization.
+    Controls residual-norm growth through depth at negligible cost
+    (4 × L × D extra parameters, i.e. < 0.1 % of total).
+    """
+
+    def __init__(self, d_model: int, device=None):
+        super().__init__()
+        self.alpha = nn.Parameter(torch.ones(d_model, device=device))
+        self.beta = nn.Parameter(torch.zeros(d_model, device=device))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.alpha * x + self.beta
+
+
 # ---------------------------------------------------
 #  Problem 11: Implement Cross-Entropy Loss Function
 # ---------------------------------------------------
@@ -96,6 +116,30 @@ def cross_entropy(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     target_probs = log_probs.gather(dim=-1, index=target.unsqueeze(-1))
     # Step 3: Compute the negative log likelihood loss
     return -target_probs.squeeze(-1).mean()
+
+
+# ----------------------------------------------------
+#  Problem 13: Implement gradient clipping by L2 norm
+# ----------------------------------------------------
+def gradient_clipping(parameters, max_l2_norm: float, eps: float = 1e-6):
+    """In-place clip the combined L2 norm of `parameters`' gradients.
+
+    Mirrors torch.nn.utils.clip_grad.clip_grad_norm_ semantics:
+        1. compute total = sqrt(sum_i ||g_i||_2^2)
+        2. if total > max_l2_norm, scale every grad by max_l2_norm / (total + eps)
+    Parameters without a .grad (e.g. frozen ones) are skipped.
+    """
+    if isinstance(parameters, torch.Tensor):
+        parameters = [parameters]
+    grads = [p.grad for p in parameters if p.grad is not None]
+    if not grads:
+        return torch.tensor(0.0)
+    total = torch.norm(torch.stack([g.detach().float().norm(2) for g in grads]), 2)
+    clip_coef = max_l2_norm / (total + eps)
+    if clip_coef < 1.0:
+        for g in grads:
+            g.detach().mul_(clip_coef.to(g.dtype))
+    return total
 
 
 # ------------------------------------------------------------------

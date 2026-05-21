@@ -5,7 +5,7 @@
     "special_tokens": [
         "<|endoftext|>"
     ],
-    "attention_type": "MHA",
+    "attention_type": "CCA",
     "context_length": 512,
     "d_model": 512,
     "num_layers": 8,
@@ -24,5 +24,8 @@
     "temperature": 0.8,
     "top_k": 0,
     "top_p": 0.9,
-    "use_amp": true
+    "use_amp": true,
+    "cca_compressed_dim": null,
+    "cca_conv_kernel_size": 3,
+    "cca_num_kv_heads": null
 }

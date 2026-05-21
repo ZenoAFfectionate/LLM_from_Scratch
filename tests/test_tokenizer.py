@@ -462,3 +462,79 @@ def _encode(tokenizer, text):
     for just this function. We set the memory limit to 1MB.
     """
     return tokenizer.encode(text)
+
+
+# =============================================================================
+# Additional self-contained tests for the Tokenizer class.
+# These do NOT depend on the pre-trained gpt2 fixtures: they build a tiny
+# tokenizer from scratch so they're fast and easy to debug.
+# =============================================================================
+
+def _tiny_byte_vocab():
+    """Build the bare 256-byte vocabulary (every byte is its own token)."""
+    return {i: bytes([i]) for i in range(256)}
+
+
+def test_tokenizer_decode_inverts_encode_no_merges():
+    """With no merges, encode/decode is a pure byte roundtrip."""
+    from model.tokenizer.bpe_tokenizer import Tokenizer
+    tok = Tokenizer(vocab=_tiny_byte_vocab(), merges=[])
+    text = "hello, world! 你好 🦊"
+    ids = tok.encode(text)
+    out = tok.decode(ids)
+    assert out == text
+
+
+def test_tokenizer_special_tokens_are_kept_intact():
+    """A special token must encode to a single id, even if its bytes look mergeable."""
+    from model.tokenizer.bpe_tokenizer import Tokenizer
+    vocab = _tiny_byte_vocab()
+    special = "<|endoftext|>"
+    tok = Tokenizer(vocab=vocab, merges=[], special_tokens=[special])
+    text = f"hi {special} bye"
+    ids = tok.encode(text)
+    # the special token id should appear exactly once
+    eot_id = tok.special_tokens_vocab[special]
+    assert ids.count(eot_id) == 1
+    # round-trip recovers the original string
+    assert tok.decode(ids) == text
+
+
+def test_tokenizer_overlapping_special_tokens_prefer_longest():
+    """If "<|eot|>" and "<|eot|extra|>" both exist, the longer must match first."""
+    from model.tokenizer.bpe_tokenizer import Tokenizer
+    short = "<|eot|>"
+    long = "<|eot|extra|>"
+    tok = Tokenizer(vocab=_tiny_byte_vocab(), merges=[],
+                    special_tokens=[short, long])
+    ids = tok.encode(long)
+    long_id = tok.special_tokens_vocab[long]
+    # The longer token's id must appear — and the shorter must NOT lock in first
+    assert long_id in ids
+
+
+def test_tokenizer_encode_iterable_matches_full_encode():
+    """encode_iterable yields the same ids as encode() over a concatenated stream."""
+    from model.tokenizer.bpe_tokenizer import Tokenizer
+    tok = Tokenizer(vocab=_tiny_byte_vocab(), merges=[])
+    pieces = ["hello ", "world ", "from ", "tests"]
+    streamed = list(tok.encode_iterable(iter(pieces)))
+    direct = tok.encode("".join(pieces))
+    assert streamed == direct
+
+
+def test_train_bpe_on_synthetic_data(tmp_path):
+    """Train BPE on a tiny corpus and verify it produces the expected number
+    of merges and a usable vocab."""
+    from model.tokenizer.bpe_tokenizer import train_bpe, Tokenizer
+    text = ("the quick brown fox jumps over the lazy dog\n" * 50)
+    fp = tmp_path / "corpus.txt"
+    fp.write_text(text)
+    vocab, merges = train_bpe(str(fp), vocab_size=300, special_tokens=["<eos>"])
+    # vocab is bounded by what we asked for
+    assert len(vocab) <= 300
+    assert len(merges) > 0
+    # Encode/decode roundtrip on a held-out string from the training distribution
+    tok = Tokenizer(vocab=vocab, merges=merges, special_tokens=["<eos>"])
+    s = "the quick brown fox"
+    assert tok.decode(tok.encode(s)) == s

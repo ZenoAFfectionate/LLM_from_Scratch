@@ -18,6 +18,7 @@ from torch.nn.utils import clip_grad_norm_
 
 from model.config import Config
 from model.transformer import TransformerLM
+from model.mHC_transformer import mHCTransformerLM
 from model.tokenizer.bpe_tokenizer import Tokenizer
 from model.optimizer.Muon import MuonAdamWOptimizer
 from data.lm_dataset import PretrainDataset
@@ -88,6 +89,14 @@ def train(model: nn.Module, optimizer: torch.optim.Optimizer,
         targets_flat = targets.view(-1)
         # compute loss and scale for gradient accumulation
         loss = F.cross_entropy(logits_flat, targets_flat)
+
+        # z-loss (PaLM §5.1): keeps logsumexp(logits) near 0 to prevent softmax
+        # entropy collapse under BF16. No-op when z_loss_alpha == 0.
+        z_loss_alpha = config.get('z_loss_alpha', 0.0)
+        if z_loss_alpha > 0:
+            log_z = torch.logsumexp(logits_flat.float(), dim=-1)
+            loss = loss + z_loss_alpha * (log_z ** 2).mean()
+
         loss = loss / gradient_accumulation_steps
 
     # backward pass with gradient accumulation:
@@ -98,6 +107,22 @@ def train(model: nn.Module, optimizer: torch.optim.Optimizer,
     # only update weights and clip gradients on the last accumulation step
     grad_norm = torch.tensor(0.0, device=device)
     if accumulation_step == gradient_accumulation_steps - 1:
+        # ── Defensive grad scrub for GDA hybrids ──
+        # fla 0.4.2's `chunk_gated_delta_rule` Triton kernel (used by
+        # GatedDeltaAttention) allocates its forward output and backward
+        # gradient buffers via `torch.empty()` and on some input shapes does
+        # not write to every position. The unwritten positions inherit
+        # whatever the CUDA allocator handed out (often NaN/Inf), which then
+        # propagates through the rest of the backward graph. We already
+        # scrub the forward output inside the GDA module; here we scrub the
+        # remaining parameter grads so a single bad chunk does not poison
+        # the whole optimizer state. No-op for clean grads, so safe to
+        # always run.
+        if config.get('gda_ratio', 'none') != 'none':
+            for p in model.parameters():
+                if p.grad is not None:
+                    torch.nan_to_num_(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
+
         grad_norm = clip_grad_norm_(model.parameters(), config['max_grad_norm'])
         optimizer.step()
 
@@ -180,6 +205,40 @@ def main():
     if args.muon_ns_steps is not None:
         config.muon_ns_steps = args.muon_ns_steps
 
+    # === Early checkpoint gate: skip if done, auto-resume if partially trained ===
+    # Resolve the checkpoint directory from config alone (no model/data needed yet),
+    # so we can short-circuit BEFORE any expensive init (wandb, tokenizer, model compile).
+    attention_type = config.attention_type
+    use_moe = config.use_moe
+    ffn_type = 'MoE' if use_moe else 'FFN'
+    module_config = f"{attention_type}+{ffn_type}"
+    # Ablation suffixes: keep folder names backward-compatible (no suffix when
+    # gda_ratio is "none" and residual_type is "resscale"), otherwise append
+    # `_gda{ratio}` and/or `_res-{type}` so different ablations don't collide.
+    suffix = ""
+    if getattr(config, "gda_ratio", "none") != "none":
+        suffix += f"_gda{config.gda_ratio.replace(':', '-')}"
+    if getattr(config, "residual_type", "resscale") != "resscale":
+        suffix += f"_res-{config.residual_type}"
+    dataset_name = config.dataset
+    checkpoint_folder_name = f"{dataset_name}_{module_config}{suffix}"
+    checkpoint_dir = Path(config.checkpoint_dir) / checkpoint_folder_name
+    final_model_path = checkpoint_dir / "final_model.pt"
+
+    if final_model_path.is_file():
+        print(f"[SKIP] {checkpoint_folder_name}: final_model.pt already exists at {final_model_path}")
+        print(f"       Training already complete. Delete the directory to retrain from scratch.")
+        return
+
+    auto_resumed = False
+    if args.resume is None and checkpoint_dir.is_dir():
+        iter_ckpts = sorted(checkpoint_dir.glob("checkpoint_iter_*.pt"))
+        if iter_ckpts:
+            args.resume = str(iter_ckpts[-1])
+            auto_resumed = True
+            print(f"[AUTO-RESUME] {checkpoint_folder_name}: found {len(iter_ckpts)} checkpoint(s)")
+            print(f"              Resuming from latest: {args.resume}")
+
     # Create extended config dict for wandb (config is still Config object)
     wandb_config = config.to_dict()
     wandb_config['gradient_accumulation_steps'] = args.gradient_accumulation_steps
@@ -239,7 +298,12 @@ def main():
     # Initialize model with BF16 weights for native mixed-precision training.
     # This eliminates costly FP32→BF16 weight casting on every forward pass.
     # The optimizer (fused AdamW) maintains FP32 master weights internally.
-    model = TransformerLM(config=config, device=device, dtype=torch.bfloat16).to(device)
+    # Residual dispatch: mHC needs the parallel-streams TransformerLM variant;
+    # vanilla / resscale share the standard TransformerLM (Block toggles internally).
+    if getattr(config, "residual_type", "resscale") == "mhc":
+        model = mHCTransformerLM(config=config, device=device, dtype=torch.bfloat16).to(device)
+    else:
+        model = TransformerLM(config=config, device=device, dtype=torch.bfloat16).to(device)
 
     # count trainable parameters of the model
     total_params = sum(p.numel() for p in model.parameters())
@@ -247,9 +311,17 @@ def main():
     print(f"Total parameters: {total_params:,}")
     print(f"Trainable parameters: {trainable_params:,}")
 
-    # Compile the model with torch.compile for better performance
-    print("Compiling model with torch.compile...")
-    model = torch.compile(model, mode="default", fullgraph=True)
+    # Compile the model with torch.compile for better performance.
+    # GDA layers use fla's `causal_conv1d` whose decorator contexts trip
+    # `fullgraph=True` Dynamo tracing — fall back to graph-breaking compile
+    # when any GDA layer is present.
+    has_gda = getattr(config, "gda_ratio", "none") != "none"
+    if has_gda:
+        print("Compiling model with torch.compile (fullgraph=False due to GDA fla kernels)...")
+        model = torch.compile(model, mode="default", fullgraph=False)
+    else:
+        print("Compiling model with torch.compile...")
+        model = torch.compile(model, mode="default", fullgraph=True)
     print("Model compiled successfully")
 
     # Initialize optimizer based on config
@@ -290,15 +362,7 @@ def main():
         print(f"Resuming from checkpoint: {args.resume}")
         start_iteration = load_checkpoint(args.resume, model, optimizer)
         print(f"Resumed from iteration {start_iteration}")
-    # config model type
-    attention_type = config.attention_type
-    use_moe = config.use_moe
-    ffn_type = 'MoE' if use_moe else 'FFN'
-    module_config = f"{attention_type}+{ffn_type}"
-    # config ckpt dirtory
-    dataset_name = config.dataset
-    checkpoint_folder_name = f"{dataset_name}_{module_config}"
-    checkpoint_dir = Path(config.checkpoint_dir) / checkpoint_folder_name
+    # checkpoint_dir, module_config, etc. were resolved earlier (see early gate).
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Checkpoint directory: {checkpoint_dir}")
@@ -312,48 +376,59 @@ def main():
 
     record_file_path = checkpoint_dir / "record.txt"  # create record file path
 
-    # initialize record file with header and config
-    with open(record_file_path, 'w') as record_file:
-        record_file.write(f"Training Record for {config.dataset}\n")
-        record_file.write("=" * 80 + "\n")
-        record_file.write(f"Model: {config.run_name}\n")
-        record_file.write(f"Optimizer: {config.optimizer.upper()}\n")
-        record_file.write(f"Started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-        record_file.write(f"Config file: {args.config}\n")
-        record_file.write("=" * 80 + "\n\n")
+    # Append on resume (preserves prior training log); 'w' on fresh runs.
+    is_resume = auto_resumed or args.resume is not None
+    record_mode = 'a' if is_resume else 'w'
+    with open(record_file_path, record_mode) as record_file:
+        if is_resume:
+            record_file.write("\n" + "=" * 80 + "\n")
+            record_file.write(f"[RESUMED] {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            record_file.write(f"[RESUMED] from checkpoint: {args.resume}\n")
+            record_file.write(f"[RESUMED] at iteration: {start_iteration}\n")
+            record_file.write("=" * 80 + "\n\n")
+        else:
+            record_file.write(f"Training Record for {config.dataset}\n")
+            record_file.write("=" * 80 + "\n")
+            record_file.write(f"Model: {config.run_name}\n")
+            record_file.write(f"Optimizer: {config.optimizer.upper()}\n")
+            record_file.write(f"Started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            record_file.write(f"Config file: {args.config}\n")
+            record_file.write("=" * 80 + "\n\n")
 
-        # Write optimizer configuration
-        if use_muon:
-            record_file.write("OPTIMIZER CONFIGURATION (Muon + AdamW):\n")
+        # Header sections below only on a fresh run (already in record.txt on resume).
+        if not is_resume:
+            # Write optimizer configuration
+            if use_muon:
+                record_file.write("OPTIMIZER CONFIGURATION (Muon + AdamW):\n")
+                record_file.write("-" * 80 + "\n")
+                record_file.write(f"Muon LR (max): {config.muon_lr}\n")
+                record_file.write(f"Muon LR (min): {config.muon_min_lr}\n")
+                record_file.write(f"Muon Momentum: {config.muon_momentum}\n")
+                record_file.write(f"Muon Nesterov: {config.muon_nesterov}\n")
+                record_file.write(f"Muon NS Steps: {config.muon_ns_steps}\n")
+                record_file.write(f"Muon Weight Decay: {config.muon_weight_decay}\n")
+                record_file.write(f"AdamW LR (max): {config.max_lr}\n")
+                record_file.write(f"AdamW LR (min): {config.min_lr}\n")
+                record_file.write(f"AdamW Weight Decay: {config.weight_decay}\n")
+                record_file.write("-" * 80 + "\n\n")
+
+            # Write full configuration
+            record_file.write("FULL CONFIGURATION:\n")
             record_file.write("-" * 80 + "\n")
-            record_file.write(f"Muon LR (max): {config.muon_lr}\n")
-            record_file.write(f"Muon LR (min): {config.muon_min_lr}\n")
-            record_file.write(f"Muon Momentum: {config.muon_momentum}\n")
-            record_file.write(f"Muon Nesterov: {config.muon_nesterov}\n")
-            record_file.write(f"Muon NS Steps: {config.muon_ns_steps}\n")
-            record_file.write(f"Muon Weight Decay: {config.muon_weight_decay}\n")
-            record_file.write(f"AdamW LR (max): {config.max_lr}\n")
-            record_file.write(f"AdamW LR (min): {config.min_lr}\n")
-            record_file.write(f"AdamW Weight Decay: {config.weight_decay}\n")
+            record_file.write(json.dumps(config.to_dict(), indent=2))
+            record_file.write("\n" + "-" * 80 + "\n\n")
+
+            # Write model architecture summary
+            record_file.write("MODEL ARCHITECTURE:\n")
+            record_file.write("-" * 80 + "\n")
+            record_file.write(
+                f"ATT Type: [{attention_type}]   MLP Type: [{ffn_type}]\n")
+            record_file.write(f"Total parameters: {total_params:,}\n")
+            record_file.write(f"Trainable parameters: {trainable_params:,}\n")
+            record_file.write(f"Gradient Accumulation Steps: {gradient_accumulation_steps}\n")
+            record_file.write(f"Micro Batch Size: {config.batch_size}\n")
+            record_file.write(f"Effective Batch Size: {effective_batch_size}\n")
             record_file.write("-" * 80 + "\n\n")
-
-        # Write full configuration
-        record_file.write("FULL CONFIGURATION:\n")
-        record_file.write("-" * 80 + "\n")
-        record_file.write(json.dumps(config.to_dict(), indent=2))
-        record_file.write("\n" + "-" * 80 + "\n\n")
-
-        # Write model architecture summary
-        record_file.write("MODEL ARCHITECTURE:\n")
-        record_file.write("-" * 80 + "\n")
-        record_file.write(
-            f"ATT Type: [{attention_type}]   MLP Type: [{ffn_type}]\n")
-        record_file.write(f"Total parameters: {total_params:,}\n")
-        record_file.write(f"Trainable parameters: {trainable_params:,}\n")
-        record_file.write(f"Gradient Accumulation Steps: {gradient_accumulation_steps}\n")
-        record_file.write(f"Micro Batch Size: {config.batch_size}\n")
-        record_file.write(f"Effective Batch Size: {effective_batch_size}\n")
-        record_file.write("-" * 80 + "\n\n")
 
     print("Starting training...")
     print("-" * 60)

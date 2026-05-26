@@ -44,9 +44,12 @@ class MultiHeadSelfAttention(nn.Module):
         # initialize the projection layers with explicit dtype
         self.qkv_proj = nn.Linear(d_model, 3 * d_model, device=device, dtype=dtype)
         self.output_proj = nn.Linear(d_model, d_model, device=device, dtype=dtype)
-        # initalize the normalization layers (uses FP32 internally)
-        self.q_norm = nn.RMSNorm(d_model, device=device)
-        self.k_norm = nn.RMSNorm(d_model, device=device)
+        # Per-head QK-norm (Olmo-2 / Chameleon style): RMSNorm over head_dim, applied
+        # AFTER the (batch, seq, num_heads, head_dim) reshape. Stabilises attention
+        # logits under BF16 / FP16 mixed precision much better than a single
+        # nn.RMSNorm(d_model) applied before the head split.
+        self.q_norm = nn.RMSNorm(self.head_dim, device=device)
+        self.k_norm = nn.RMSNorm(self.head_dim, device=device)
         self.rope = rope
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -66,13 +69,15 @@ class MultiHeadSelfAttention(nn.Module):
 
         # project input to q, k, v using fused projection
         q, k, v = self.qkv_proj(x).chunk(3, dim=-1)
-        q = self.q_norm(q)
-        k = self.k_norm(k)
 
         # reshape q, k, v for multi-head attention: (batch, num_heads, seq_len, head_dim)
         q = q.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         k = k.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         v = v.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+
+        # per-head QK-norm (over head_dim) — applied after split, before RoPE
+        q = self.q_norm(q)
+        k = self.k_norm(k)
 
         # apply RoPE to q and k using token_positions
         if self.rope is not None:
@@ -115,13 +120,15 @@ class MultiHeadSelfAttention(nn.Module):
 
         # Project Q, K, V using fused projection
         q, k, v = self.qkv_proj(x_flat).chunk(3, dim=-1)
-        q = self.q_norm(q)
-        k = self.k_norm(k)
 
         # Reshape to (total_tokens, num_heads, head_dim)
         q = q.view(total_tokens, self.num_heads, self.head_dim)
         k = k.view(total_tokens, self.num_heads, self.head_dim)
         v = v.view(total_tokens, self.num_heads, self.head_dim)
+
+        # per-head QK-norm (over head_dim) — applied after split, before RoPE
+        q = self.q_norm(q)
+        k = self.k_norm(k)
 
         # Apply RoPE
         if self.rope is not None:

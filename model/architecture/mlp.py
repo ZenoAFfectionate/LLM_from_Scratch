@@ -62,18 +62,36 @@ def silu(x: torch.Tensor) -> torch.Tensor:
 
 
 class MLP(nn.Module):
-    """Special SwiGLU MLP network with matrix fusion optimization."""
-    def __init__(self, d_model: int, d_ff: int = None, device=None, dtype=None):
+    """SwiGLU MLP with fused gate+up projection.
+
+    Combines two engineering knobs from the DeepSeek-V3.1/V4 expert design with a
+    fused gate/up matmul (Llama / Mistral style) for performance:
+
+      * ``swiglu_limit``: optional symmetric clamp on the up projection and an
+        upper clamp on the gate, used by DeepSeek-V3.1/V4 to keep SwiGLU
+        activations numerically stable under low-precision training.
+      * ``weights`` (forward kwarg): optional per-token routing weight that the
+        layer multiplies into the activations before the down projection. Lets
+        the module double as an MoE expert without an external scatter step.
+        When ``None`` the module behaves exactly like the previous fused MLP.
+    """
+
+    def __init__(self, d_model: int, d_ff: int = None,
+                 swiglu_limit: float = 0.0, device=None, dtype=None):
         super().__init__()
         if d_ff is None: d_ff = 64 * ((int(d_model * 8 / 3) + 64 - 1) // 64)
-        # initialize three linear projection for SwiGLU:
-        # use BF16 for weights but computation uses FP32
-        self.w1 = nn.Linear(d_model, d_ff*2, device=device, dtype=dtype)  # shape: (d_ff, 2*d_model)
-        self.w2 = nn.Linear(d_ff, d_model, device=device, dtype=dtype)    # shape: (d_model, d_ff)
-        # self.dropout = nn.Dropout(dropout=0.1)  # no need Dropout inside
+        # Fused gate+up projection: (2*d_ff, d_model), split via chunk in forward.
+        self.w1 = nn.Linear(d_model, d_ff * 2, device=device, dtype=dtype)
+        self.w2 = nn.Linear(d_ff, d_model, device=device, dtype=dtype)
+        self.swiglu_limit = float(swiglu_limit)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Let autocast handle dtype management automatically
-        w1_out, w3_out = self.w1(x).chunk(2, dim=-1)
-        activated = F.silu(w1_out) * w3_out  # use F.silu() here
-        return self.w2(activated)
+    def forward(self, x: torch.Tensor, weights: torch.Tensor = None) -> torch.Tensor:
+        gate, up = self.w1(x).chunk(2, dim=-1)
+        if self.swiglu_limit > 0:
+            # See DeepSeek-V3.1/V4: symmetric clamp on up, upper clamp on gate.
+            up = torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)
+            gate = torch.clamp(gate, max=self.swiglu_limit)
+        h = F.silu(gate) * up
+        if weights is not None:
+            h = h * weights
+        return self.w2(h)

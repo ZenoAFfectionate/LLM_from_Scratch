@@ -1,5 +1,4 @@
 {
-    "run_name": "GQA and MoE on TinyStories",
     "seed": 42,
     "dataset": "TinyStories",
     "data_dir": "/home/kemove/Courses/STF_LLM/Assignment_1/data/TinyStories",
@@ -16,9 +15,7 @@
     "num_heads": 16,
     "d_ff": 1344,
     "dropout": 0.1,
-    "attention_type": "GQA",
     "rope_theta": 10000.0,
-    "num_kv_heads": 4,
     "use_moe": true,
     "moe_layers": [
         1,
@@ -60,5 +57,10 @@
     "log_interval": 100,
     "eval_interval": 1000,
     "eval_batches": 100,
-    "checkpoint_dir": "/home/kemove/Courses/STF_LLM/Assignment_1/checkpoints"
+    "checkpoint_dir": "/home/kemove/Courses/STF_LLM/Assignment_1/checkpoints",
+    "attention_type": "MHA",
+    "num_kv_heads": 16,
+    "gda_ratio": "1:1",
+    "residual_type": "resscale",
+    "run_name": "[MHA+MoE] GDA=1:1 on TinyStories"
 }

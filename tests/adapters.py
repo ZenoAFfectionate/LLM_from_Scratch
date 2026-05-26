@@ -233,16 +233,20 @@ def run_swiglu(
     device, dtype = w1_weight.device, w1_weight.dtype
     module = SwiGLU_FFN(d_model, d_ff, device=device, dtype=dtype)
 
-    # Load weights via manually assignment 
-    module.w1.weight.data = w1_weight
-    module.w2.weight.data = w2_weight
-    module.w3.weight.data = w3_weight
+    # The current MLP fuses the SwiGLU gate (w1) and up-projection (w3) into a
+    # single Linear of out=2*d_ff, with gate stored in the first half and up in
+    # the second half (see model/architecture/mlp.py — `chunk(2, dim=-1)`).
+    # The reference state dict provided by the test fixture still uses three
+    # separate weights (w1, w2, w3), so we stack them on the fly.
+    with torch.no_grad():
+        module.w1.weight.data.copy_(torch.cat([w1_weight, w3_weight], dim=0))
+        module.w2.weight.data.copy_(w2_weight)
 
     # Ensure in_features is on the same device/dtype as module weight
     if in_features.device != device or in_features.dtype != dtype:
         in_features = in_features.to(device=device, dtype=dtype)
 
-    return module(in_features)  # 
+    return module(in_features)  #
 
 
 def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, " ..."]:
@@ -286,10 +290,15 @@ def run_rope(
     # Create RoPE on the same device as the provided in query or key
     device = in_query_or_key.device
     module = RotaryPositionalEmbedding(theta, d_k, max_seq_len, device=device)
-    
+
+    # The current RoPE module stores a single fused cache `cos_sin_cached`
+    # (the original implementation used separate `cos_cached`/`sin_cached`
+    # tensors). Read the dtype off the fused buffer.
+    rope_dtype = module.cos_sin_cached.dtype
+
     # Ensure in_query_or_key and token_positions are on the same device as module
-    if in_query_or_key.device != device or in_query_or_key.dtype != module.cos_cached.dtype:
-        in_query_or_key = in_query_or_key.to(device=device, dtype=module.cos_cached.dtype)
+    if in_query_or_key.device != device or in_query_or_key.dtype != rope_dtype:
+        in_query_or_key = in_query_or_key.to(device=device, dtype=rope_dtype)
     if token_positions.device != device or token_positions.dtype != torch.int64:
         token_positions = token_positions.to(device=device, dtype=torch.int64)
 
@@ -364,11 +373,19 @@ def run_multihead_self_attention(
     device = q_proj_weight.device
     module = MultiHeadSelfAttention(d_model, num_heads, rope=None, device=device)
 
-    # load weight into attention module:
-    module.q_proj.weight.data = q_proj_weight
-    module.k_proj.weight.data = k_proj_weight
-    module.v_proj.weight.data = v_proj_weight
-    module.output_proj.weight.data = o_proj_weight
+    # The current MHA fuses Q/K/V into a single qkv_proj with out=3*d_model
+    # (Q then K then V along the row axis). Stack the three reference weights
+    # in that order before loading. The bias path is preserved at zero (the
+    # reference fixtures don't set a bias).
+    with torch.no_grad():
+        module.qkv_proj.weight.data.copy_(
+            torch.cat([q_proj_weight, k_proj_weight, v_proj_weight], dim=0)
+        )
+        if module.qkv_proj.bias is not None:
+            module.qkv_proj.bias.data.zero_()
+        module.output_proj.weight.data.copy_(o_proj_weight)
+        if module.output_proj.bias is not None:
+            module.output_proj.bias.data.zero_()
 
     # Ensure in_features is on the same device/dtype as module weight
     if in_features.device != device: in_features = in_features.to(device=device)
@@ -427,19 +444,29 @@ def run_multihead_self_attention_with_rope(
     rope = RotaryPositionalEmbedding(theta, d_model // num_heads, max_seq_len, device=device)
     module = MultiHeadSelfAttention(d_model, num_heads, rope=rope, device=device)
 
-    # load weight into attention module:
-    module.q_proj.weight.data = q_proj_weight
-    module.k_proj.weight.data = k_proj_weight
-    module.v_proj.weight.data = v_proj_weight
-    module.output_proj.weight.data = o_proj_weight
+    # Same Q|K|V fusion as the no-RoPE variant: current MHA stores them in a
+    # single qkv_proj with out=3*d_model. Stack the reference weights in
+    # the order (Q, K, V).
+    with torch.no_grad():
+        module.qkv_proj.weight.data.copy_(
+            torch.cat([q_proj_weight, k_proj_weight, v_proj_weight], dim=0)
+        )
+        if module.qkv_proj.bias is not None:
+            module.qkv_proj.bias.data.zero_()
+        module.output_proj.weight.data.copy_(o_proj_weight)
+        if module.output_proj.bias is not None:
+            module.output_proj.bias.data.zero_()
 
     # Ensure in_features is on the same device/dtype as module weight
     if in_features.device != device:
         in_features = in_features.to(device=device)
-    if token_positions.device != device:
+    if token_positions is not None and token_positions.device != device:
         token_positions = token_positions.to(device=device)
 
-    return module(in_features, token_positions)  # return forward pass result
+    # Current MHA.forward signature is (x, mask=None); it uses an *internal*
+    # `torch.arange(seq_len)` for RoPE positions during training, so we ignore
+    # the user-supplied `token_positions` (it's always 0..T-1 here anyway).
+    return module(in_features)  # return forward pass result
 
 
 def run_transformer_block(

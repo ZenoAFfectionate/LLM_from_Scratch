@@ -258,6 +258,12 @@ def train(model: nn.Module, mtp_predictor: nn.Module, optimizer: torch.optim.Opt
         targets_flat = targets.view(-1)
         main_loss = F.cross_entropy(logits_flat, targets_flat)
 
+        # z-loss (PaLM §5.1): keep main-head logsumexp near 0. No-op at alpha=0.
+        z_loss_alpha = config.get('z_loss_alpha', 0.0)
+        if z_loss_alpha > 0:
+            log_z = torch.logsumexp(logits_flat.float(), dim=-1)
+            main_loss = main_loss + z_loss_alpha * (log_z ** 2).mean()
+
         # mtp forward and compute loss
         mtp_loss = torch.tensor(0.0, device=device)
 

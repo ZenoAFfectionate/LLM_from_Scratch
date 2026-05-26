@@ -127,12 +127,20 @@ class Config:
         cca_layer_ids: Optional[List[int]] = None,
 
         # Gated Delta Attention (GDA) hybrid configuration
-        # When `use_gda_hybrid=True` *and* `attention_type` is one of
-        # {"MHA", "GQA", "MLA"}, the Transformer alternates 1:1: even layers
-        # (0, 2, ...) keep the primary attention, odd layers (1, 3, ...) become
-        # GDA. CCA already provides local sequence-mixing convolutions so it is
-        # **never** paired with GDA — the flag is silently ignored for CCA and
-        # the model stays pure CCA.
+        #
+        # `gda_ratio` controls how GDA layers are interleaved with the primary
+        # attention (MHA / GQA / MLA) over a 4-layer block (Qwen3-Next style:
+        # GDA layers first, primary attention at the end of each block):
+        #     "none" → all primary attention (no GDA)
+        #     "3:1"  → [G, G, G, A] per 4 layers (6/2 for num_layers=8)
+        #     "1:1"  → [G, G, A, A] per 4 layers (4/4 for num_layers=8)
+        #     "1:3"  → [G, A, A, A] per 4 layers (2/6 for num_layers=8)
+        # CCA already provides local sequence-mixing convolutions, so it is
+        # **never** paired with GDA — `gda_ratio` is silently treated as
+        # "none" when `attention_type == "CCA"`.
+        #
+        # `use_gda_hybrid` is kept as a backward-compat alias: when True and
+        # `gda_ratio == "none"`, it is interpreted as `gda_ratio="1:1"`.
         #
         # Defaults are deliberately moderate — parameter count is roughly on
         # par with one standard-attention layer (no bloat, no underspec):
@@ -140,12 +148,22 @@ class Config:
         #     gda_num_k_heads = max(1, num_heads // 2)  → key_dim = ~d_model / 2 (GVA 2:1)
         #     head_k_dim = head_v_dim = d_model // num_heads
         #     conv kernel = 4   (matches Qwen3-Next short conv)
+        gda_ratio: str = "none",
         use_gda_hybrid: bool = False,
         gda_num_v_heads: Optional[int] = None,
         gda_num_k_heads: Optional[int] = None,
         gda_head_k_dim: Optional[int] = None,
         gda_head_v_dim: Optional[int] = None,
         gda_conv_kernel_size: int = 4,
+
+        # Residual connection variant (applied uniformly across all Blocks):
+        #     "vanilla"  → x + sublayer(RMSNorm(x))   (standard pre-norm)
+        #     "resscale" → ZAYA1 learned residual scaling
+        #                  α_res·x + β_res + α_out·sublayer(RMSNorm(x)) + β_out
+        #                  (current default in TransformerLM)
+        #     "mhc"      → Manifold-Constrained Hyper-Connection with
+        #                  `hc_mult` parallel streams (uses mHCTransformerLM)
+        residual_type: str = "resscale",
 
         # MoE configuration
         use_moe: bool = True,
@@ -155,6 +173,28 @@ class Config:
         n_shared_experts: int = 1,
         aux_seq_loss_alpha: float = 0.01,
         bias_update_speed: float = 0.01,
+
+        # SwiGLU activation clamp (DeepSeek-V3.1/V4):
+        #   up_t   = clamp(up,   ±limit)
+        #   gate_t = clamp(gate, max=limit)
+        # Prevents SwiGLU activation blow-ups under BF16. ``0.0`` disables it;
+        # the V3.1 reference uses ``7.0``. Applied to BOTH the dense MLP and
+        # every MoE expert (routed + shared).
+        swiglu_limit: float = 0.0,
+
+        # Multi-Token Prediction (DeepSeek-V3 §2.3)
+        # When `use_mtp=True`, train.py uses train_mtp.train() which adds
+        # `mtp_lambda * (1/D) * Σ CE(h_k -> t_{i+k+2})` to the main loss.
+        # Default `mtp_lambda=0.1` matches the V3 report.
+        use_mtp: bool = False,
+        mtp_num_depths: int = 2,
+        mtp_lambda: float = 0.1,
+
+        # z-loss regularizer (PaLM §5.1, T5 §3.4): adds
+        #   `z_loss_alpha * mean(logsumexp(logits)**2)`
+        # to the loss, keeping the log-partition function near 0 and preventing
+        # softmax-output entropy collapse under BF16. Standard value: 1e-4.
+        z_loss_alpha: float = 0.0,
 
         # Engram configuration
         use_engram: bool = False,
@@ -238,7 +278,16 @@ class Config:
         self.cca_layer_ids = cca_layer_ids
 
         # Gated Delta Attention hybrid configuration
-        self.use_gda_hybrid = use_gda_hybrid
+        # Backward-compat: when `use_gda_hybrid=True` and `gda_ratio="none"`,
+        # treat it as the legacy 1:1 schedule.
+        if gda_ratio == "none" and use_gda_hybrid:
+            gda_ratio = "1:1"
+        if gda_ratio not in ("none", "3:1", "1:1", "1:3"):
+            raise ValueError(
+                f"gda_ratio must be one of 'none', '3:1', '1:1', '1:3'; got {gda_ratio!r}"
+            )
+        self.gda_ratio = gda_ratio
+        self.use_gda_hybrid = gda_ratio != "none"  # derived; kept for legacy readers
         self.gda_num_v_heads = (
             gda_num_v_heads if gda_num_v_heads is not None else num_heads
         )
@@ -256,6 +305,13 @@ class Config:
         )
         self.gda_conv_kernel_size = gda_conv_kernel_size
 
+        # Residual connection variant
+        if residual_type not in ("vanilla", "resscale", "mhc"):
+            raise ValueError(
+                f"residual_type must be one of 'vanilla', 'resscale', 'mhc'; got {residual_type!r}"
+            )
+        self.residual_type = residual_type
+
         # MoE configuration
         self.use_moe = use_moe
         self.moe_layers = moe_layers
@@ -264,6 +320,17 @@ class Config:
         self.n_shared_experts = n_shared_experts
         self.aux_seq_loss_alpha = aux_seq_loss_alpha
         self.bias_update_speed = bias_update_speed
+
+        # SwiGLU activation clamp
+        self.swiglu_limit = swiglu_limit
+
+        # Multi-Token Prediction
+        self.use_mtp = use_mtp
+        self.mtp_num_depths = mtp_num_depths
+        self.mtp_lambda = mtp_lambda
+
+        # z-loss
+        self.z_loss_alpha = z_loss_alpha
 
         # Engram configuration
         self.use_engram = use_engram

@@ -14,15 +14,52 @@ from model.attention.GDA import GatedDeltaAttention
 
 
 # ----------------------------------------
+#  GDA layer scheduling (Qwen3-Next style)
+# ----------------------------------------
+_GDA_BLOCK_PATTERNS = {
+    "none": [False, False, False, False],
+    "3:1":  [True,  True,  True,  False],
+    "1:1":  [True,  True,  False, False],
+    "1:3":  [True,  False, False, False],
+}
+
+
+def build_gda_layer_mask(num_layers: int, gda_ratio: str) -> list:
+    """Return a list of booleans indicating which layers use GDA.
+
+    The pattern repeats every 4 layers. For `num_layers` not divisible by 4,
+    the tail is truncated from the same repeating pattern. Within each 4-layer
+    block, GDA layers come first, primary attention at the end.
+
+    Args:
+        num_layers: total number of transformer layers.
+        gda_ratio:  one of "none", "3:1", "1:1", "1:3".
+
+    Returns:
+        list[bool] of length `num_layers` — True = GDA, False = primary.
+    """
+    if gda_ratio not in _GDA_BLOCK_PATTERNS:
+        raise ValueError(
+            f"gda_ratio must be one of {list(_GDA_BLOCK_PATTERNS)}, got {gda_ratio!r}"
+        )
+    block = _GDA_BLOCK_PATTERNS[gda_ratio]
+    return [block[i % 4] for i in range(num_layers)]
+
+
+# ----------------------------------------
 #  Problem 9: Implement Transformer Block
 # ----------------------------------------
 class Block(nn.Module):
     """
-    Transformer Block with learned residual scaling (ZAYA1-8B Eq. 6):
+    Transformer Block — supports two residual schemes:
 
-        xl+1 = Res-scale_res(xl) + Res-scale_out(Layer(RMSnorm(xl)))
+    - `residual_type="vanilla"` (standard pre-norm):
+        x_mid = x + Attn(RMSNorm(x))
+        x_out = x_mid + FFN(RMSNorm(x_mid))
 
-    where Res-scale(x) = α·x + β (α init=1, β init=0 → identity).
+    - `residual_type="resscale"` (ZAYA1-8B Eq. 6, learned residual scaling):
+        x_mid = ResScale_res_att(x) + ResScale_out_att(Attn(RMSNorm(x)))
+        x_out = ResScale_res_ffn(x_mid) + ResScale_out_ffn(FFN(RMSNorm(x_mid)))
     """
 
     def __init__(
@@ -31,11 +68,17 @@ class Block(nn.Module):
         rope: RotaryPositionalEmbedding,
         use_moe: bool,
         use_gda: bool = False,
+        residual_type: str = "resscale",
         device=None,
         dtype=None
     ):
         super().__init__()
         self.use_moe = use_moe
+        if residual_type not in ("vanilla", "resscale"):
+            raise ValueError(
+                f"Block residual_type must be 'vanilla' or 'resscale'; got {residual_type!r}"
+            )
+        self.residual_type = residual_type
         # When use_gda=True, the attention sub-block is GatedDeltaAttention
         # regardless of `config.attention_type`. This is used by TransformerLM
         # to build a 1:1 hybrid (primary attention ↔ GDA) without touching the
@@ -82,7 +125,7 @@ class Block(nn.Module):
                      else config.d_model // config.num_heads // 2)
             kv_heads = (config.cca_num_kv_heads
                         if config.cca_num_kv_heads is not None
-                        else config.num_heads // 4)
+                        else max(1, config.num_heads // 4))
             self.att = CompressedConvAttention(
                 d_model=config.d_model,
                 num_query_heads=config.num_heads,
@@ -104,53 +147,46 @@ class Block(nn.Module):
                 n_shared_experts=config.n_shared_experts,
                 aux_seq_loss_alpha=config.aux_seq_loss_alpha,
                 bias_update_speed=config.bias_update_speed,
+                swiglu_limit=config.swiglu_limit,
                 device=device,
                 dtype=dtype
             )
         else:
-            self.ffn = MLP(config.d_model, config.d_ff, device=device, dtype=dtype)
+            self.ffn = MLP(
+                config.d_model, config.d_ff,
+                swiglu_limit=config.swiglu_limit,
+                device=device, dtype=dtype,
+            )
 
-        # ── Normalization (without residual add — residual scaling handles that) ──
+        # ── Normalization ──
         self.att_norm = RMSNorm(config.d_model, device=device)
         self.ffn_norm = RMSNorm(config.d_model, device=device)
 
-        # ── Learned residual scaling (paper Eq. 6) ──
-        # res-scale for the residual stream (applied to xl before each sub-block)
-        self.res_scale_att = ResScale(config.d_model, device=device)
-        self.res_scale_ffn = ResScale(config.d_model, device=device)
-        # out-scale for each sub-block's output
-        self.out_scale_att = ResScale(config.d_model, device=device)
-        self.out_scale_ffn = ResScale(config.d_model, device=device)
+        # ── Residual scaling (only for "resscale") ──
+        if residual_type == "resscale":
+            self.res_scale_att = ResScale(config.d_model, device=device)
+            self.res_scale_ffn = ResScale(config.d_model, device=device)
+            self.out_scale_att = ResScale(config.d_model, device=device)
+            self.out_scale_ffn = ResScale(config.d_model, device=device)
 
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, xl: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
-        """
-        Forward pass with learned residual scaling.
+        """Forward pass dispatched by `residual_type`."""
+        if self.residual_type == "vanilla":
+            # Standard pre-norm residual.
+            xl = xl + self.dropout(self.att(self.att_norm(xl), mask))
+            xl = xl + self.dropout(self.ffn(self.ffn_norm(xl)))
+            return xl
 
-            xl_mid = Res-scale_res_att(xl) + Res-scale_out_att(Attn(RMSnorm(xl)))
-            xl_out  = Res-scale_res_ffn(xl_mid) + Res-scale_out_ffn(FFN(RMSnorm(xl_mid)))
-
-        Args:
-            xl: residual stream input  (batch, seq, d_model)
-            mask: optional attention mask (unused; is_causal=True handles it)
-        Returns:
-            xl: updated residual stream
-        """
-        # ── Attention sub-block ──
-        normed = self.att_norm(xl)                        # RMSNorm(xl)
-        att_out = self.att(normed, mask)                  # Attn(RMSnorm(xl))
-        att_out = self.dropout(att_out)
+        # ── ZAYA1 ResScale residual ──
+        normed = self.att_norm(xl)
+        att_out = self.dropout(self.att(normed, mask))
         xl = self.res_scale_att(xl) + self.out_scale_att(att_out)
-        # xl_mid = Res-scale_res(xl) + Res-scale_out(Attn(RMSnorm(xl)))
 
-        # ── FFN sub-block ──
-        normed = self.ffn_norm(xl)                        # RMSNorm(xl_mid)
-        ffn_out = self.ffn(normed)                         # FFN(RMSnorm(xl_mid))
-        ffn_out = self.dropout(ffn_out)
+        normed = self.ffn_norm(xl)
+        ffn_out = self.dropout(self.ffn(normed))
         xl = self.res_scale_ffn(xl) + self.out_scale_ffn(ffn_out)
-        # xl_out = Res-scale_res(xl_mid) + Res-scale_out(FFN(RMSnorm(xl_mid)))
-
         return xl
 
 
@@ -185,18 +221,22 @@ class TransformerLM(nn.Module):
         )
 
         # Build Transformer layers.
-        # Hybrid GDA: when enabled and the primary attention is one of
-        # {MHA, GQA, MLA}, alternate 1:1 — even layers use the primary
-        # attention, odd layers use GDA. CCA already has local sequence-mixing
-        # convolutions, so it is *never* paired with GDA: when attention_type
-        # is "CCA", the hybrid flag is silently ignored and every layer stays
-        # CCA. (`gda_layer_indices` is also stored for downstream inspection.)
-        is_hybrid = config.use_gda_hybrid and config.attention_type != "CCA"
-        gda_layer_indices = (
-            [i for i in range(config.num_layers) if i % 2 == 1]
-            if is_hybrid else []
+        # Hybrid GDA: when `config.gda_ratio != "none"` and the primary attention
+        # is one of {MHA, GQA, MLA}, layers are scheduled per the Qwen3-Next style
+        # 4-layer pattern (see `build_gda_layer_mask`). CCA already has local
+        # sequence-mixing convolutions, so it is *never* paired with GDA: when
+        # `attention_type == "CCA"`, GDA is silently disabled and every layer
+        # stays CCA. (`gda_layer_indices` is also stored for downstream inspection.)
+        gda_ratio = (
+            config.gda_ratio if config.attention_type != "CCA" else "none"
         )
+        gda_mask = build_gda_layer_mask(config.num_layers, gda_ratio)
+        gda_layer_indices = [i for i, use in enumerate(gda_mask) if use]
         self.gda_layer_indices = gda_layer_indices
+
+        residual_type = (
+            config.residual_type if config.residual_type != "mhc" else "resscale"
+        )
 
         self.layers = nn.ModuleList([
             Block(
@@ -205,6 +245,7 @@ class TransformerLM(nn.Module):
                 use_moe=(config.use_moe and (
                     config.moe_layers is None or i in config.moe_layers)),
                 use_gda=(i in gda_layer_indices),
+                residual_type=residual_type,
                 device=device,
                 dtype=dtype
             )
@@ -212,6 +253,12 @@ class TransformerLM(nn.Module):
         ])
         self.final_norm = RMSNorm(config.d_model, device=device)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, device=device, dtype=dtype)
+
+        # Weight tying: share the (vocab, d_model) embedding matrix with the LM head.
+        # Both `Embedding.weight` and `nn.Linear.weight` are stored as (vocab, d_model),
+        # so the assignment is a direct alias. Acts as ~5M-param regularizer on this
+        # 35M model and is standard for small-data pretraining (GPT-2, Llama).
+        self.lm_head.weight = self.token_embeddings.weight
 
     def forward(self, x: torch.Tensor):
         """

@@ -17,6 +17,7 @@
     "d_ff": 3072,
     "dropout": 0.1,
     "attention_type": "MLA",
+    "z_loss_alpha": 0.0,
     "rope_theta": 10000.0,
     "rope_dim": 16,
     "q_lora_rank": 192,

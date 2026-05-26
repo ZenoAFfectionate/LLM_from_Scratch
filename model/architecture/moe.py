@@ -10,7 +10,21 @@ from model.architecture.kernels import fused_scatter_add_weighted
 
 
 class Gate(nn.Module):
-    """ PyTorch implementation of MoE Gate mechanism with Auxiliary-Loss-Free Load Balancing """
+    """ PyTorch implementation of MoE Gate mechanism with Auxiliary-Loss-Free Load Balancing.
+
+    Supports three affinity-score activations corresponding to DeepSeek's MoE evolution:
+      - "softmax"      → DeepSeek-V2
+      - "sigmoid"      → DeepSeek-V3 (normalized sigmoid gating)
+      - "sqrtsoftplus" → DeepSeek-V4 (default; see V4 tech-report §2.1)
+
+    Follows the V3/V4 gating semantics where the per-expert load-balance bias is
+    added to the *activated* affinity scores (not raw logits), and the gathered
+    top-k weights are renormalized within the selected experts (for non-softmax
+    score functions), then scaled by a multiplicative ``route_scale`` factor.
+    """
+
+    # advertised score-function options
+    SUPPORTED_SCORE_FUNCS = ("softmax", "sigmoid", "sqrtsoftplus")
 
     def __init__(
         self,
@@ -19,6 +33,8 @@ class Gate(nn.Module):
         num_experts_per_tok: int,
         bias_update_speed: float = 0.01,
         aux_seq_loss_alpha: float = 0.01,
+        score_func: str = "sqrtsoftplus",
+        route_scale: float = 1.0,
         device=None,
         dtype=None
     ):
@@ -30,28 +46,74 @@ class Gate(nn.Module):
         # parameters for load balancing
         self.seq_alpha = aux_seq_loss_alpha
         self.bias_update_speed = bias_update_speed
+        # DeepSeek-V4 gating: score-function selector + multiplicative route scale
+        if score_func not in self.SUPPORTED_SCORE_FUNCS:
+            raise ValueError(
+                f"Unsupported score_func={score_func!r}; "
+                f"expected one of {self.SUPPORTED_SCORE_FUNCS}"
+            )
+        self.score_func = score_func
+        self.route_scale = float(route_scale)
         # initialize gating weights for affinity score calculation
         self.weight = nn.Parameter(torch.empty((self.n_routed_experts, self.hidden_size), device=device, dtype=dtype))
         init.kaiming_uniform_(self.weight, a=math.sqrt(5))
         self.register_buffer('expert_load', torch.zeros(self.n_routed_experts, device=device, dtype=torch.long))
         self.register_buffer('expert_bias', torch.zeros(self.n_routed_experts, device=device, dtype=torch.float32))
 
+    def _apply_score_function(self, logits: torch.Tensor) -> torch.Tensor:
+        """Apply the configured affinity-score activation per DeepSeek-V{2,3,4}.
+
+        Args:
+            logits: raw gate logits, shape (..., n_routed_experts)
+        Returns:
+            activated affinity scores of the same shape; all activations are
+            monotonic so the ordering used for top-k selection is preserved
+            relative to the raw logits when no bias is added.
+        """
+        if self.score_func == "softmax":      # DeepSeek-V2
+            return F.softmax(logits, dim=-1)
+        if self.score_func == "sigmoid":      # DeepSeek-V3
+            return torch.sigmoid(logits)
+        if self.score_func == "sqrtsoftplus": # DeepSeek-V4
+            # F.softplus(x) = log(1 + exp(x)) > 0  →  sqrt is well-defined
+            return F.softplus(logits).sqrt()
+        # defensive: __init__ already validated this
+        raise ValueError(f"Unsupported score_func: {self.score_func!r}")
+
     def forward(self, x):
-        """ Forward pass with auxiliary-loss-free load balancing """
+        """ Forward pass with auxiliary-loss-free load balancing (DeepSeek-V4 style) """
         bsz, seq_len, _ = x.shape
 
-        # compute expert logits and scores
+        # compute expert logits, then apply V2/V3/V4 score function
         x_flat = x.view(-1, x.shape[-1])
         logits = x_flat @ self.weight.t()
-        scores = torch.sigmoid(logits)
-        biased_scores = logits + self.expert_bias
+        scores = self._apply_score_function(logits)
 
-        # select top-k experts based on biased logits and their unbiased weights
+        # V3/V4: the no-aux-loss bias is added to the *activated* affinity
+        # scores (not raw logits) so the bias acts in the same value range
+        # as the scores themselves (matches DeepSeek-V3 paper Eq. for top-k
+        # routing under no-aux-loss balancing).
+        biased_scores = scores + self.expert_bias
+
+        # select top-k experts using biased scores; gather UN-biased weights
+        # so the routing magnitudes reflect true token-expert affinity.
         _, topk_indices = torch.topk(biased_scores, k=self.top_k, dim=-1, sorted=False)
         topk_weights = torch.gather(scores, dim=-1, index=topk_indices)
-        if self.top_k > 1:  # re-normalize the weights of the selected
+
+        # V4 normalization rule: softmax already gives a proper probability
+        # simplex over all experts, so the gathered slice has interpretable
+        # magnitudes and is *not* re-normalized. For sigmoid / sqrtsoftplus
+        # the values are unbounded above (or in (0,1) for sigmoid) and must
+        # be normalized within the selected top-k to stabilize their scale.
+        if self.score_func != "softmax":
             denominator = topk_weights.sum(dim=-1, keepdim=True) + 1e-10
             topk_weights = topk_weights / denominator
+
+        # V4 multiplicative route_scale (skip the multiply when 1.0 to avoid
+        # an unnecessary kernel launch and preserve numerical exactness for
+        # backward compatibility with the default config).
+        if self.route_scale != 1.0:
+            topk_weights = topk_weights * self.route_scale
 
         # use one_hot + sum instead of bincount: faster
         expert_token_counts = None
@@ -74,7 +136,7 @@ class Gate(nn.Module):
 
     def _compute_sequence_balance_loss(self, scores, topk_idx, bsz, seq_len):
         """
-        Compute sequence-wise balance loss as described in DeepSeek-V3.
+        Compute sequence-wise balance loss as described in DeepSeek-V3 / V4.
         Fully vectorized implementation - no Python loops, no GPU-CPU sync
 
         The loss encourages balanced expert load within each sequence:
@@ -84,6 +146,10 @@ class Gate(nn.Module):
         - f_i: fraction of tokens in sequence where expert i is in top-K (eq. 18)
         - P_i: average of normalized routing probabilities for expert i (eq. 19-20)
         - α: small hyperparameter weight (seq_alpha)
+
+        ``scores`` here are the *un-biased* activated affinity scores from the
+        configured score function. softmax already sums to 1 over experts, so
+        the per-token renormalization is a no-op and we skip it.
         """
         scores_reshaped = scores.view(bsz, seq_len, self.n_routed_experts)  # (bsz, seq_len, n_experts)
         topk_idx_reshaped = topk_idx.view(bsz, seq_len, self.top_k)         # (bsz, seq_len, top_k)
@@ -97,7 +163,10 @@ class Gate(nn.Module):
         expert_counts = expert_mask.sum(dim=1)  # (bsz, n_experts)
         f_i = expert_counts.to(scores.dtype) / (self.top_k * seq_len)  # (bsz, n_experts)
 
-        # vectorized P_i calculation: (bsz, n_experts):
+        # vectorized P_i: per-token renormalize scores to a simplex (sigmoid /
+        # sqrtsoftplus need it; softmax is already a simplex so the divide is
+        # a no-op but harmless — kept unconditional to preserve the existing
+        # numerical behavior of this helper).
         score_sums = scores_reshaped.sum(dim=2, keepdim=True)       # (bsz, seq_len, 1)
         normalized_scores = scores_reshaped / (score_sums + 1e-10)  # (bsz, seq_len, n_experts)
         P_i = normalized_scores.mean(dim=1)  # (bsz, n_experts)
@@ -121,7 +190,12 @@ class MOE(nn.Module):
     """
     Mixture of Experts Feed-Forward Network with Auxiliary-Loss-Free Load Balancing
     In this implementation, we optimize the training path using a sort-based approach
-    to achieve better memory access patterns and scalability with number of experts. 
+    to achieve better memory access patterns and scalability with number of experts.
+
+    The gating semantics follow DeepSeek-V4 by default (``score_func="sqrtsoftplus"``,
+    ``route_scale=1.0``), but the ``score_func`` kwarg may be set to ``"sigmoid"``
+    (DeepSeek-V3) or ``"softmax"`` (DeepSeek-V2) for ablation / backward
+    compatibility studies.
     """
 
     def __init__(
@@ -134,6 +208,9 @@ class MOE(nn.Module):
         bias_update_speed: float = 0.01,
         aux_seq_loss_alpha: float = 0.01,
         capacity_factor: float = 1.5,
+        score_func: str = "sqrtsoftplus",
+        route_scale: float = 1.0,
+        swiglu_limit: float = 0.0,
         device=None,
         dtype=None
     ):
@@ -144,11 +221,13 @@ class MOE(nn.Module):
         self.num_experts_per_tok = num_experts_per_tok
         self.n_shared_experts = n_shared_experts
         self.capacity_factor = capacity_factor
+        self.score_func = score_func
+        self.route_scale = float(route_scale)
         # ============================================== #
         # write efficient kernel for expert computation  #
-        # ============================================== # 
+        # ============================================== #
         self.experts = nn.ModuleList([
-            MLP(d_model, d_ff, device=device, dtype=dtype)
+            MLP(d_model, d_ff, swiglu_limit=swiglu_limit, device=device, dtype=dtype)
             for _ in range(n_routed_experts)
         ])
         self.gate = Gate(
@@ -157,11 +236,17 @@ class MOE(nn.Module):
             num_experts_per_tok=num_experts_per_tok,
             aux_seq_loss_alpha=aux_seq_loss_alpha,
             bias_update_speed=bias_update_speed,
+            score_func=score_func,
+            route_scale=route_scale,
+            device=device,
             dtype=dtype,
         )
         # Initialize shared expert (single MLP)
         if n_shared_experts > 0:
-            self.shared_expert = MLP(d_model, d_ff, device=device, dtype=dtype)
+            self.shared_expert = MLP(
+                d_model, d_ff, swiglu_limit=swiglu_limit,
+                device=device, dtype=dtype,
+            )
 
     @staticmethod
     def _compute_within_expert_positions(sorted_expert_ids):

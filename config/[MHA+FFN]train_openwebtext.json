@@ -17,6 +17,7 @@
     "d_ff": 3072,
     "dropout": 0.1,
     "attention_type": "MHA",
+    "z_loss_alpha": 0.0,
     "rope_theta": 10000.0,
     "optimizer": "muon",
     "muon_lr": 0.02,

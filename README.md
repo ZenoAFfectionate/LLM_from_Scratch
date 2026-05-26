@@ -699,11 +699,12 @@ All TinyStories experiments use an 8-layer Transformer with `d_model=512`, 16 at
 
 | Attention | Forward | **Loss** | **PPL** | **Iteration Time** |
 |-----------|---------|----------|---------|---------------------|
-| MHA       | FFN     | 0.4886   | 1.63    | 0.245s              |
-| MHA       | MoE     | 0.4887   | 1.63    | 0.275s              |
-| GQA       | FFN     | 0.4929   | 1.64    | 0.242s              |
-| GQA       | MoE     | 0.4942   | 1.64    | 0.275s              |
-| MLA       | MoE     | 0.4996   | 1.65    | 0.285s              |
+| MHA       | FFN     | 0.5043   | 1.66    | 0.245s              |
+| MHA       | MoE     | 0.5052   | 1.66    | 0.275s              |
+| GQA       | FFN     | 0.5131   | 1.67    | 0.242s              |
+| GQA       | MoE     | 0.5148   | 1.67    | 0.275s              |
+| CCA       | MoE     | 0.5212   | 1.68    | 0.281s              |
+| MLA       | MoE     | 0.5220   | 1.69    | 0.285s              |
 
 The most striking observation from the TinyStories experiments is the remarkably narrow performance spread across all architectural configurations: the loss ranges from 0.4886 to 0.4996, and perplexity varies only between 1.63 and 1.65. This near-uniform convergence strongly suggests that the TinyStories dataset—a synthetic corpus composed of simple children's stories with limited vocabulary and straightforward narrative patterns—presents a modeling task that is well within the capacity of even the simplest configuration tested. When the dataset complexity is low enough, additional architectural sophistication yields diminishing returns in final quality.
 

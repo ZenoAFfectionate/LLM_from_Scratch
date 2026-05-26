@@ -113,6 +113,66 @@ def test_mlp_uses_fused_swiglu_projection():
     assert layer.w2.weight.shape == (d_model, d_ff)
 
 
+def test_mlp_default_matches_unclamped_path():
+    """swiglu_limit=0 (default) must reproduce the previous unclamped behavior bit-exactly."""
+    torch.manual_seed(0)
+    layer = MLP(d_model=8, d_ff=16)
+    x = torch.randn(2, 3, 8)
+    # Manual SwiGLU reference using the same fused weights.
+    gate, up = layer.w1(x).chunk(2, dim=-1)
+    expected = layer.w2(F.silu(gate) * up)
+    torch.testing.assert_close(layer(x), expected, atol=0.0, rtol=0.0)
+
+
+def test_mlp_swiglu_clamp_bounds_intermediate_activations():
+    """With swiglu_limit > 0, the clamped pre-activations must respect the bounds."""
+    limit = 0.5
+    torch.manual_seed(0)
+    layer = MLP(d_model=8, d_ff=16, swiglu_limit=limit)
+    # Blow up the gate/up projection so unclamped activations clearly exceed `limit`.
+    with torch.no_grad():
+        layer.w1.weight.mul_(50.0)
+    x = torch.randn(4, 8)
+    gate_raw, up_raw = layer.w1(x).chunk(2, dim=-1)
+    # Sanity: at least some raw activations exceed the limit, so the clamp is exercised.
+    assert (up_raw.abs() > limit).any() and (gate_raw > limit).any()
+    # Reproduce the layer's internal clamped product and confirm bounds.
+    up_clamped = torch.clamp(up_raw, min=-limit, max=limit)
+    gate_clamped = torch.clamp(gate_raw, max=limit)
+    assert up_clamped.abs().max().item() <= limit + 1e-6
+    assert gate_clamped.max().item() <= limit + 1e-6
+    # End-to-end output must equal the manually clamped reference.
+    expected = layer.w2(F.silu(gate_clamped) * up_clamped)
+    torch.testing.assert_close(layer(x), expected, atol=0.0, rtol=0.0)
+
+
+def test_mlp_routing_weights_scale_output_linearly():
+    """Passing routing weights in forward must scale the pre-down activations."""
+    torch.manual_seed(0)
+    layer = MLP(d_model=8, d_ff=16)
+    x = torch.randn(2, 4, 8)
+    # Scalar weight broadcast — compare against manual reference (w2 has bias,
+    # so the layer is affine, not linear; verify against the exact computation).
+    s = 0.25
+    gate, up = layer.w1(x).chunk(2, dim=-1)
+    expected_scalar = layer.w2(F.silu(gate) * up * s)
+    torch.testing.assert_close(
+        layer(x, weights=torch.tensor(s)), expected_scalar, atol=1e-6, rtol=1e-5
+    )
+    # Per-token weight broadcast over the hidden dim.
+    w = torch.rand(2, 4, 1)
+    expected = layer.w2(F.silu(gate) * up * w)
+    torch.testing.assert_close(layer(x, weights=w), expected, atol=1e-6, rtol=1e-5)
+
+
+def test_mlp_weights_none_is_identity():
+    """weights=None must be bit-identical to omitting the argument."""
+    torch.manual_seed(0)
+    layer = MLP(d_model=8, d_ff=16)
+    x = torch.randn(2, 4, 8)
+    torch.testing.assert_close(layer(x), layer(x, weights=None), atol=0.0, rtol=0.0)
+
+
 # ====================================================================== MoE
 
 def test_gate_output_shapes():
@@ -215,6 +275,198 @@ def test_moe_shared_expert_contributes():
     y_yes = layer_with_shared(x)
     # outputs must differ
     assert not torch.allclose(y_no, y_yes, atol=1e-5)
+
+
+# ============================================== DeepSeek-V4 MoE gate features
+
+def test_gate_default_score_func_is_v4_sqrtsoftplus():
+    """Default gating should be DeepSeek-V4 (sqrt(softplus))."""
+    from model.architecture.moe import Gate
+    gate = Gate(hidden_size=8, n_routed_experts=4, num_experts_per_tok=2)
+    assert gate.score_func == "sqrtsoftplus"
+    assert gate.route_scale == 1.0
+    # SUPPORTED_SCORE_FUNCS contract preserved
+    assert "softmax" in gate.SUPPORTED_SCORE_FUNCS
+    assert "sigmoid" in gate.SUPPORTED_SCORE_FUNCS
+    assert "sqrtsoftplus" in gate.SUPPORTED_SCORE_FUNCS
+
+
+def test_gate_score_function_matches_formula():
+    """_apply_score_function must implement the three DeepSeek formulas exactly."""
+    from model.architecture.moe import Gate
+    logits = torch.randn(7, 5) * 2.0
+    gate_sm = Gate(hidden_size=8, n_routed_experts=5, num_experts_per_tok=1, score_func="softmax")
+    gate_sg = Gate(hidden_size=8, n_routed_experts=5, num_experts_per_tok=1, score_func="sigmoid")
+    gate_sp = Gate(hidden_size=8, n_routed_experts=5, num_experts_per_tok=1, score_func="sqrtsoftplus")
+    torch.testing.assert_close(gate_sm._apply_score_function(logits), F.softmax(logits, dim=-1))
+    torch.testing.assert_close(gate_sg._apply_score_function(logits), torch.sigmoid(logits))
+    torch.testing.assert_close(gate_sp._apply_score_function(logits), F.softplus(logits).sqrt())
+
+
+def test_gate_rejects_unknown_score_func():
+    """Unknown score_func must raise ValueError listing supported options."""
+    from model.architecture.moe import Gate
+    with pytest.raises(ValueError, match="Unsupported score_func"):
+        Gate(hidden_size=8, n_routed_experts=4, num_experts_per_tok=1,
+             score_func="gelu")
+
+
+@pytest.mark.parametrize("score_func", ["softmax", "sigmoid", "sqrtsoftplus"])
+def test_gate_forward_works_for_all_score_funcs(score_func):
+    """All three score functions must produce finite, shape-correct outputs."""
+    from model.architecture.moe import Gate
+    n_exp, top_k = 4, 2
+    gate = Gate(hidden_size=8, n_routed_experts=n_exp, num_experts_per_tok=top_k,
+                score_func=score_func)
+    gate.train()
+    topk_idx, topk_w, _, counts = gate(torch.randn(2, 5, 8))
+    assert topk_idx.shape == (10, top_k) and topk_w.shape == (10, top_k)
+    assert torch.isfinite(topk_w).all()
+    assert int(topk_idx.min()) >= 0 and int(topk_idx.max()) < n_exp
+    # Indices are valid expert IDs; counts cover the right total.
+    assert counts.sum().item() == 10 * top_k
+
+
+def test_gate_non_softmax_weights_normalized_in_topk():
+    """sigmoid / sqrtsoftplus paths must yield per-token weight sum = 1 (route_scale=1)."""
+    from model.architecture.moe import Gate
+    for sf in ("sigmoid", "sqrtsoftplus"):
+        gate = Gate(hidden_size=8, n_routed_experts=4, num_experts_per_tok=2, score_func=sf)
+        _, topk_w, _, _ = gate(torch.randn(3, 6, 8))
+        sums = topk_w.sum(dim=-1)
+        torch.testing.assert_close(sums, torch.ones_like(sums), atol=1e-5, rtol=1e-5)
+
+
+def test_gate_softmax_path_skips_renormalization():
+    """For softmax, gathered top-k weights are raw softmax probabilities (sum < 1 in general)."""
+    from model.architecture.moe import Gate
+    torch.manual_seed(123)
+    gate = Gate(hidden_size=8, n_routed_experts=6, num_experts_per_tok=2, score_func="softmax")
+    _, topk_w, _, _ = gate(torch.randn(4, 4, 8))
+    # top-2 of a 6-way softmax: sum should be in (0, 1] but virtually never 1.
+    sums = topk_w.sum(dim=-1)
+    assert (sums <= 1.0 + 1e-5).all()
+    assert (sums < 1.0).any()
+
+
+def test_gate_route_scale_multiplies_weights():
+    """route_scale must scale the (normalized) top-k weights linearly."""
+    from model.architecture.moe import Gate
+    torch.manual_seed(7)
+    x = torch.randn(1, 5, 8)
+    gate_one = Gate(hidden_size=8, n_routed_experts=4, num_experts_per_tok=2,
+                    score_func="sqrtsoftplus", route_scale=1.0)
+    gate_two = Gate(hidden_size=8, n_routed_experts=4, num_experts_per_tok=2,
+                    score_func="sqrtsoftplus", route_scale=2.5)
+    # Use the same weights so routing decisions match exactly.
+    with torch.no_grad():
+        gate_two.weight.copy_(gate_one.weight)
+    _, w1, _, _ = gate_one(x)
+    _, w2, _, _ = gate_two(x)
+    torch.testing.assert_close(w2, w1 * 2.5, atol=1e-6, rtol=1e-5)
+
+
+def test_gate_bias_added_to_activated_scores_not_logits():
+    """V4 semantics: large negative bias on expert k must push k out of top-k
+    even when its raw logits are largest, because bias acts in activated-score range."""
+    from model.architecture.moe import Gate
+    gate = Gate(hidden_size=4, n_routed_experts=3, num_experts_per_tok=1, score_func="sqrtsoftplus")
+    # Construct a hidden so that logits clearly prefer expert 0.
+    with torch.no_grad():
+        gate.weight.zero_()
+        gate.weight[0] = torch.tensor([1.0, 0.0, 0.0, 0.0])
+        gate.weight[1] = torch.tensor([0.5, 0.0, 0.0, 0.0])
+        gate.weight[2] = torch.tensor([0.1, 0.0, 0.0, 0.0])
+    x = torch.tensor([[[10.0, 0.0, 0.0, 0.0]]])  # logits ≈ [10, 5, 1]
+    # No bias: expert 0 wins.
+    topk_idx, _, _, _ = gate(x)
+    assert topk_idx.flatten().tolist() == [0]
+    # Heavily penalize expert 0 in the *activated* score range to flip the choice.
+    with torch.no_grad():
+        gate.expert_bias[0] = -10.0
+    topk_idx, _, _, _ = gate(x)
+    assert topk_idx.flatten().tolist() != [0], "Negative bias on activated scores must demote expert 0"
+
+
+def test_gate_weights_use_unbiased_scores():
+    """The returned routing weights must be derived from the *un-biased* activated scores,
+    so that adding a uniform positive bias to all experts does NOT change the weights
+    (it can only change which experts get selected, not their weight magnitudes)."""
+    from model.architecture.moe import Gate
+    torch.manual_seed(0)
+    gate = Gate(hidden_size=8, n_routed_experts=4, num_experts_per_tok=2, score_func="sqrtsoftplus")
+    x = torch.randn(1, 5, 8)
+    _, w_a, _, _ = gate(x)
+    with torch.no_grad():
+        gate.expert_bias += 5.0  # uniform shift → preserves ordering → same indices
+    _, w_b, _, _ = gate(x)
+    torch.testing.assert_close(w_a, w_b, atol=1e-6, rtol=1e-5)
+
+
+def test_gate_sqrtsoftplus_outputs_nonnegative_and_finite():
+    """sqrt(softplus(x)) is well-defined (>0) for any finite logit — sanity for very negative inputs."""
+    from model.architecture.moe import Gate
+    gate = Gate(hidden_size=4, n_routed_experts=4, num_experts_per_tok=1, score_func="sqrtsoftplus")
+    out = gate._apply_score_function(torch.tensor([[-1e3, -1.0, 0.0, 1e3]]))
+    assert torch.isfinite(out).all()
+    assert (out >= 0).all()
+
+
+@cuda_only
+@pytest.mark.parametrize("score_func", ["softmax", "sigmoid", "sqrtsoftplus"])
+def test_moe_forward_works_for_all_score_funcs(score_func):
+    """End-to-end MOE forward must succeed for each V2/V3/V4 score function."""
+    from model.architecture.moe import MOE
+    layer = MOE(
+        d_model=16, d_ff=32,
+        n_routed_experts=4, num_experts_per_tok=2, n_shared_experts=1,
+        score_func=score_func, route_scale=1.0,
+        device="cuda", dtype=torch.float32,
+    ).cuda()
+    x = torch.randn(2, 8, 16, device="cuda")
+    y = layer(x)
+    assert y.shape == x.shape
+    assert torch.isfinite(y).all()
+
+
+@cuda_only
+def test_moe_forward_route_scale_changes_output():
+    """route_scale != 1.0 must scale the routed contribution proportionally."""
+    from model.architecture.moe import MOE
+    torch.manual_seed(0)
+    layer_a = MOE(
+        d_model=16, d_ff=32,
+        n_routed_experts=4, num_experts_per_tok=2, n_shared_experts=0,
+        score_func="sqrtsoftplus", route_scale=1.0,
+        device="cuda", dtype=torch.float32,
+    ).cuda()
+    torch.manual_seed(0)
+    layer_b = MOE(
+        d_model=16, d_ff=32,
+        n_routed_experts=4, num_experts_per_tok=2, n_shared_experts=0,
+        score_func="sqrtsoftplus", route_scale=2.0,
+        device="cuda", dtype=torch.float32,
+    ).cuda()
+    x = torch.randn(1, 4, 16, device="cuda")
+    y_a = layer_a(x)
+    y_b = layer_b(x)
+    # Same routing decisions but doubled weight on routed experts → expect ~2x.
+    torch.testing.assert_close(y_b, 2.0 * y_a, atol=1e-4, rtol=1e-4)
+
+
+def test_moe_propagates_v4_kwargs_to_gate():
+    """MOE.__init__ must thread score_func / route_scale through to the Gate instance."""
+    from model.architecture.moe import MOE
+    layer = MOE(
+        d_model=16, d_ff=32,
+        n_routed_experts=4, num_experts_per_tok=2,
+        n_shared_experts=0,
+        score_func="sigmoid", route_scale=2.5,
+    )
+    assert layer.score_func == "sigmoid"
+    assert layer.route_scale == 2.5
+    assert layer.gate.score_func == "sigmoid"
+    assert layer.gate.route_scale == 2.5
 
 
 # =============================================================== StreamEmbed

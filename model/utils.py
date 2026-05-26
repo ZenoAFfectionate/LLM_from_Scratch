@@ -50,11 +50,16 @@ class Embedding(nn.Module):
 class RMSNorm(nn.Module):
     """Root Mean Square Normalization with Fused Add & Norm."""
 
-    def __init__(self, d_model: int, eps: float = 1e-5, device=None):
+    def __init__(self, d_model: int, eps: float = 1e-5, device=None, dtype=None):
         super().__init__()
         self.eps = eps
+        # RMSNorm scale parameter is conventionally kept in FP32 for numerical
+        # stability of the variance computation; `dtype` is accepted for API
+        # compatibility with other modules that thread (device, dtype) through.
+        if dtype is None:
+            dtype = torch.float32
         self.weight = nn.Parameter(torch.ones(
-            d_model, dtype=torch.float32, device=device))
+            d_model, dtype=dtype, device=device))
 
     def forward(self, x: torch.Tensor, residual: Optional[torch.Tensor] = None):
         dtype = x.dtype

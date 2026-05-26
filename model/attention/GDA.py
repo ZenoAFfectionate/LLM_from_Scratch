@@ -14,6 +14,31 @@ from fla.ops.gated_delta_rule import (
 from .utils import compute_varlen_positions  # only used to mirror sibling API
 
 
+class _NaNScrub(torch.autograd.Function):
+    """Replace NaN/Inf with 0 in both forward output AND backward gradient.
+
+    Workaround for the fla 0.4.2 `chunk_gated_delta_rule` kernel, whose
+    forward and backward Triton kernels both allocate their output buffers
+    via `torch.empty()` and on some input shapes leave a subset of positions
+    unwritten — those positions contain whatever the CUDA allocator handed
+    out (commonly NaN/Inf from earlier tensors). Symptom: an alternating
+    clean/dirty NaN pattern across repeated calls with identical inputs.
+    Scrubbing on both sides keeps the rest of the network finite.
+    """
+
+    @staticmethod
+    def forward(ctx, x):
+        return torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return torch.nan_to_num(grad_output, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _scrub_nan(x: torch.Tensor) -> torch.Tensor:
+    return _NaNScrub.apply(x)
+
+
 class GatedDeltaAttention(nn.Module):
     """
     Gated Delta Attention (GDA) as used in Qwen3-Next's linear-attention layers.
@@ -97,10 +122,22 @@ class GatedDeltaAttention(nn.Module):
 
         # ---- decay parameters (per value-head) ---------------------------
         # A ~ U(1, 16), store its log so exp(A_log) > 0.
+        # dt_bias ~ log-uniform(0.001, 0.1) — matches the Qwen3-Next reference
+        # (transformers.models.qwen3_next.modeling_qwen3_next.Qwen3NextGatedDeltaNet).
+        # With the previous constant `dt_bias = 1.0`, the decay
+        #     g_t = -exp(A_log) * softplus(a_t + dt_bias)
+        # spans [-25, -2] per head (A_log itself reaches log(16) ≈ 2.77 and
+        # softplus(1+a) ≈ 1.3), which underflows the cumulative decay
+        # exp(Σ g_t) in `chunk_gated_delta_rule`'s chunk recurrence and surfaces
+        # as ~40% NaN output. The log-uniform init keeps g in roughly
+        # [-1.7, -0.02], well within the kernel's numerically stable regime.
         A = torch.empty(num_v_heads, device=device).uniform_(1.0, 16.0)
         self.A_log = nn.Parameter(torch.log(A))
         self.A_log._no_weight_decay = True
-        self.dt_bias = nn.Parameter(torch.ones(num_v_heads, device=device))
+        dt_bias_init = torch.empty(num_v_heads, device=device).uniform_(
+            math.log(0.001), math.log(0.1)
+        )
+        self.dt_bias = nn.Parameter(dt_bias_init)
         self.dt_bias._no_weight_decay = True
 
         # ---- output gating norm + projection -----------------------------
@@ -195,6 +232,10 @@ class GatedDeltaAttention(nn.Module):
             output_final_state=False,
             use_qk_l2norm_in_kernel=True,
         )                                                # (B, T, num_v_heads, head_v_dim)
+        # Scrub allocator garbage from kernel output AND its backward
+        # gradient — fla 0.4.2's chunk Triton kernel leaves some positions
+        # unwritten on certain input shapes. See `_NaNScrub` docstring above.
+        out = _scrub_nan(out)
 
         # --- output gating + projection -----------------------------------
         # z is reshaped to (B, T, num_v_heads, head_v_dim) and used as the
@@ -301,6 +342,8 @@ class GatedDeltaAttention(nn.Module):
                 output_final_state=True,
                 use_qk_l2norm_in_kernel=True,
             )
+            # See training-path comment: scrub allocator garbage from kernel output.
+            out = _scrub_nan(out)
         else:
             # single-token step
             out, final_state = fused_recurrent_gated_delta_rule(
